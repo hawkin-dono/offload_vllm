@@ -98,95 +98,73 @@ HIDDEN_STATE_TARGET_LAYER = os.getenv("HIDDEN_STATE_TARGET_LAYER")
 if HIDDEN_STATE_TARGET_LAYER is not None and HIDDEN_STATE_TARGET_LAYER != "":
     HIDDEN_STATE_TARGET_LAYER = int(HIDDEN_STATE_TARGET_LAYER)
 
-class HiddenStateLogger:
-    def __init__(
-        self,
-        log_dir: Path,
-        max_steps_per_file: int = 1,
-        filename_format: str = "hidden_states_device_{device:01d}_{start:06d}_{end:06d}.pt",
-    ):
-        self.log_dir = log_dir
-        self.max_steps_per_file = max_steps_per_file
-        self.filename_format = filename_format
-        self.buffer: List[Dict] = []
-        self.current_start_step: int | None = None
-        self.current_device_id: int | None = None
-        self.log_dir.mkdir(parents=True, exist_ok=True)
 
-    @staticmethod
-    def _normalize_device_id(device: torch.device) -> int:
-        if device.type == "cuda":
-            return device.index
-        return 0  # CPU -> device_0
+import h5py
+import numpy as np
 
-    def _to_cpu(self, value):
-        if isinstance(value, torch.Tensor):
-            return value.detach().cpu()
-        if isinstance(value, dict):
-            return {k: self._to_cpu(v) for k, v in value.items()}
-        if isinstance(value, (list, tuple)):
-            converted = [self._to_cpu(v) for v in value]
-            return type(value)(converted)
-        return value
+class GenerationTracker:
+    def __init__(self, filepath="vllm_hidden_states.h5"):
+        self.filepath = filepath
+        self.data = {}
+        self.seq_counter = 0
+        self.current_seq_id = "seq_001"
+        self.current_step = 0
 
-    def log(
-        self,
-        step: int,
-        layer_id: int,
-        tensor: torch.Tensor,
-        device: torch.device,
-        cached_weights: dict | None = None,
-    ) -> None:
-        device_id = self._normalize_device_id(device)
-        if self.current_device_id is not None and device_id != self.current_device_id:
-            self.flush()
+    def set_context(self, seq_id):
+        # Không còn tác dụng trên worker nếu gọi từ main, nhưng không gây lỗi
+        self.current_seq_id = seq_id
+        self.current_step = 0
+        self.data[seq_id] = {}
 
-        if self.current_start_step is None:
-            self.current_start_step = step
-            self.current_device_id = device_id
+    def step_forward(self):
+        self.current_step += 1
+        self.save_and_clear()
 
-        entry = {
-            "step": step,
-            "layer": layer_id,
-            "tensor": tensor.detach().cpu(),
-            "shape": tuple(tensor.shape),
-            "dtype": str(tensor.dtype),
-            "device_id": device_id,
-        }
-        if cached_weights is not None:
-            entry["cached_weights"] = self._to_cpu(cached_weights)
-        self.buffer.append(entry)
+    def log(self, layer_id, key, tensor):
+        # Auto-detect prefill phase to switch sequence in worker process
+        if key == "embedding":
+            # tensor shape: [num_tokens, hidden_size]
+            num_tokens = tensor.shape[0] if tensor.dim() >= 1 else 1
+            if num_tokens > 1:
+                # new sequence detected
+                self.seq_counter += 1
+                self.current_seq_id = f"seq_{self.seq_counter:03d}"
+                self.current_step = 0
 
-        if self.max_steps_per_file:
-            if step - self.current_start_step >= self.max_steps_per_file:
-                self.flush()
-        if HIDDEN_STATE_FLUSH_EVERY_STEP:
-            self.flush()
+        if self.current_seq_id not in self.data:
+            self.data[self.current_seq_id] = {}
 
-    def flush(self) -> None:
-        if not self.buffer:
+        seq_dict = self.data[self.current_seq_id]
+        if self.current_step not in seq_dict:
+            seq_dict[self.current_step] = {}
+        if layer_id not in seq_dict[self.current_step]:
+            seq_dict[self.current_step][layer_id] = {}
+            
+        if isinstance(tensor, torch.Tensor):
+            np_array = tensor.detach().cpu().to(torch.float16).numpy()
+        else:
+            np_array = np.array(tensor, dtype=np.float16)
+
+        seq_dict[self.current_step][layer_id][key] = np_array
+
+    def save_and_clear(self):
+        if not self.data:
             return
-        steps = [e["step"] for e in self.buffer]
-        start_step = min(steps)
-        end_step = max(steps)
-        device_id = self.current_device_id or 0
-        filename = self.filename_format.format(
-            device=device_id, start=start_step, end=end_step
-        )
-        torch.save(
-            {"entries": self.buffer, "step_range": (start_step, end_step)},
-            self.log_dir / filename,
-        )
-        self.buffer = []
-        self.current_start_step = None
-        self.current_device_id = None
+        
+        # Flush to disk immediately
+        with h5py.File(self.filepath, 'a') as f:
+            for seq_id, steps in self.data.items():
+                seq_group = f.require_group(str(seq_id))
+                for step, layers in steps.items():
+                    step_group = seq_group.require_group(f"step_{step}")
+                    for layer_id, tensors in layers.items():
+                        layer_group = step_group.require_group(f"layer_{layer_id}")
+                        for key, np_array in tensors.items():
+                            if key not in layer_group:
+                                layer_group.create_dataset(key, data=np_array, compression="lzf")
+        self.data.clear()
 
-
-hidden_state_logger = HiddenStateLogger(
-    log_dir=HIDDEN_STATE_LOG_DIR,
-    max_steps_per_file=HIDDEN_STATE_MAX_STEPS_PER_FILE,
-)
-
+global_tracker = GenerationTracker()
 
 logger = init_logger(__name__)
 
@@ -271,6 +249,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.physical_expert_end = (
             self.physical_expert_start + self.n_local_physical_experts
         )
+        self.layer_idx = extract_layer_index(prefix)
 
         self.experts = FusedMoE(
             num_experts=self.n_routed_experts,
@@ -308,6 +287,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        
+        # NOTE(hieuvt): Log router_logits
+        if self.layer_idx is not None:
+            global_tracker.log(self.layer_idx, "router_logits", router_logits)
+
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
@@ -461,12 +445,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
 
         # `mlp_only_layers` in the config.
-        layer_idx = extract_layer_index(prefix)
+        self.layer_idx = extract_layer_index(prefix)
         mlp_only_layers = (
             [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
         )
-        if (layer_idx not in mlp_only_layers) and (
-            config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
+        if (self.layer_idx not in mlp_only_layers) and (
+            config.num_experts > 0 and (self.layer_idx + 1) % config.decoder_sparse_step == 0
         ):
             self.mlp = Qwen3MoeSparseMoeBlock(
                 vllm_config=vllm_config, prefix=f"{prefix}.mlp"
@@ -499,6 +483,11 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        
+        # NOTE(hieuvt): Log attention_input
+        if self.layer_idx is not None:
+            global_tracker.log(self.layer_idx, "attention_input", hidden_states)
+            
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -509,6 +498,11 @@ class Qwen3MoeDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
         )
+        
+        # NOTE(hieuvt): Log attention_output
+        if self.layer_idx is not None:
+            global_tracker.log(self.layer_idx, "attention_output", hidden_states)
+            
         # TODO(ducct): Predict + prefetch expert weights for next layer here only if you want to prefectch after attn
         # predictor runs on CPU -> transfer hidden_states back to CPU for computation
         # The output of the expert predictor, predicted_topk_ids is used to form a CPU tensor of size (num_predicted_experts, inter_dim, hidden_dim)
@@ -532,7 +526,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             #     predicted_ids = self.expert_predictor.predict_batch(
             #         hs_cpu, top_k=self.top_k
             #     )["indices"]  # CPU
-            predicted_ids = torch.tensor([0,4,2,9], device="cpu")
+            predicted_ids = torch.tensor([], device="cpu")
 
             # NOTE(ducct):Normalize predicted ids to a unique 1D list (cache expects <= num_experts).
             # with torch.profiler.record_function("expert_ids.check_and_normalize"):
@@ -653,6 +647,9 @@ class Qwen3MoeModel(nn.Module):
             else:
                 hidden_states = self.embed_input_ids(input_ids)
             residual = None
+            
+            # NOTE(hieuvt): Log embedding output
+            global_tracker.log("embed", "embedding", hidden_states)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
@@ -698,13 +695,8 @@ class Qwen3MoeModel(nn.Module):
                     }
                     for param_name in self.expert_cache.cached_parameter_names:
                         cached_weights[param_name] = getattr(active_buffer, param_name)
-                hidden_state_logger.log(
-                    step=hidden_state_step,
-                    layer_id=layer_idx,
-                    tensor=hidden,
-                    device=hidden.device,
-                    cached_weights=cached_weights,
-                )
+
+        global_tracker.step_forward()
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
