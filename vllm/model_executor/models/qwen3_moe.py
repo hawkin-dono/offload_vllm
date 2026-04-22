@@ -81,12 +81,13 @@ import os
 from typing import Dict, List 
 from pathlib import Path
 
-from vllm.model_executor.layers.expert_prefetch import ExpertPredictorModel, ExpertCache
+from vllm.model_executor.layers.expert_prefetch import ExpertPredictorModel, ExpertCache, OraclePredictor
+from vllm.forward_context import get_forward_context
 
 # Hidden-state dump (for correctness checks)
 ENABLE_HIDDEN_STATE_DUMP = os.getenv("ENABLE_HIDDEN_STATE_DUMP", "0") == "1"
 HIDDEN_STATE_LOG_DIR = Path(
-    os.getenv("HIDDEN_STATE_LOG_DIR", "/run/user/1019/ducct/logs/hidden_state/vllm-pref")
+    os.getenv("HIDDEN_STATE_LOG_DIR", "/tmp/hieuvt/logs/hidden_state/vllm-pref")
 )
 HIDDEN_STATE_MAX_STEPS_PER_FILE = int(
     os.getenv("HIDDEN_STATE_MAX_STEPS_PER_FILE", "1")
@@ -427,8 +428,46 @@ class Qwen3MoeAttention(nn.Module):
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
+    
+def get_running_context():
+    # --- LẤY THÔNG TIN BATCH ---
+    ctx = get_forward_context()
+    
+    # 1. Lấy danh sách request_id trong batch hiện tại
+    req_ids = getattr(ctx, "req_ids", None)
+    
+    if req_ids is None:
+        return {}
 
+    # 2. Lấy metadata để tính step
+    attn_metadata = getattr(ctx, "attn_metadata", None)
+    if attn_metadata is not None:
+        # Trong vLLM V1, attn_metadata có thể là dict hoặc list[dict]
+        if isinstance(attn_metadata, list):
+            meta_dict = attn_metadata[0] if len(attn_metadata) > 0 else {}
+        else:
+            meta_dict = attn_metadata
 
+        # attn_metadata là một dictionary map từ layer_name -> AttentionMetadata object
+        # Ta lấy metadata của layer đầu tiên
+        meta = next(iter(meta_dict.values())) if isinstance(meta_dict, dict) and meta_dict else None
+
+        num_computed_tokens = None
+        if meta is not None:
+            # Thử lấy từ seq_lens (chiều dài tổng cộng của sequence)
+            if hasattr(meta, "seq_lens"):
+                num_computed_tokens = meta.seq_lens
+            elif hasattr(meta, "num_computed_tokens_cpu"):
+                num_computed_tokens = meta.num_computed_tokens_cpu
+            elif hasattr(meta, "common_attn_metadata") and hasattr(meta.common_attn_metadata, "num_computed_tokens_cpu"):
+                num_computed_tokens = meta.common_attn_metadata.num_computed_tokens_cpu
+
+        if num_computed_tokens is not None:
+            # return {req_id: num_computed_tokens[i].item() for i, req_id in enumerate(req_ids)}
+            return (req_ids, num_computed_tokens)
+                
+    return ([], [])
+    
 class Qwen3MoeDecoderLayer(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -462,6 +501,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         # `mlp_only_layers` in the config.
         layer_idx = extract_layer_index(prefix)
+        self.layer_id = layer_idx
         mlp_only_layers = (
             [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
         )
@@ -484,12 +524,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         # NOTE(ducct): add expert predictor
-        # self.expert_predictor = ExpertPredictorModel(
-        #     weight_path="/home/ducct/repos/profiling/trace-analysis/vllm-offload/epoch=01-val_acc=0.9493.ckpt",
-        #     input_dim=2880,
-        #     num_experts=config.num_local_experts,
-        #     device="cpu",
-        # )
+        self.expert_predictor = OraclePredictor(data_path="/home/hieuvt/vllm-hpclab/dataset_generate/dataset_hidden_states.h5")
         self.top_k = self.mlp.experts.top_k
 
 
@@ -520,19 +555,25 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 self._prefetch_stream = torch.cuda.Stream()
                 prefetch_stream = self._prefetch_stream
 
-            # 1) D2H copy on prefetch stream
-            # with torch.profiler.record_function("expert_prefetch.d2h_hidden_states"):
-            with torch.cuda.stream(prefetch_stream):
-                hs_cpu = hidden_states.detach().to("cpu", non_blocking=True)
-            prefetch_stream.synchronize() # ensure d2h done before CPU prediction
+            # # 1) D2H copy on prefetch stream
+            # # with torch.profiler.record_function("expert_prefetch.d2h_hidden_states"):
+            # with torch.cuda.stream(prefetch_stream):
+            #     hs_cpu = hidden_states.detach().to("cpu", non_blocking=True)
+            # prefetch_stream.synchronize() # ensure d2h done before CPU prediction
 
-            # 2) NOTE(ducct): implement CPU expert predictor
+            # 2) NOTE(hieuvt): handle seq_id
             moe = next_layer.mlp.experts
-            # with torch.profiler.record_function("ducct::expert_predictor"):
-            #     predicted_ids = self.expert_predictor.predict_batch(
-            #         hs_cpu, top_k=self.top_k
-            #     )["indices"]  # CPU
-            predicted_ids = torch.tensor([0,4,2,9], device="cpu")
+            with torch.profiler.record_function("ducct::expert_predictor"):
+                running_context = get_running_context()
+                predicted_ids = self.expert_predictor.predict_experts_batch(
+                    running_context[0], running_context[1], layer_ids= self.layer_id + 1)
+                with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
+                    for req, step in zip(running_context[0], running_context[1]):
+                        f.write(f"[GPU Layer] Request: {req} đang ở token thứ: {step}\n")
+
+                
+                # )  # CPU
+                # predicted_ids = torch.tensor([0, 1, 2, 3], device="cpu")
 
             # NOTE(ducct):Normalize predicted ids to a unique 1D list (cache expects <= num_experts).
             # with torch.profiler.record_function("expert_ids.check_and_normalize"):
