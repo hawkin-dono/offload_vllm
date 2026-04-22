@@ -113,6 +113,7 @@ class OpenAIServingCompletion(OpenAIServing):
             )
 
         request_id = f"cmpl-{self._base_request_id(raw_request, request.request_id)}"
+        logger.info(f"[hieuvt]: i catch a request_id here bro: {request_id}")
         created_time = int(time.time())
 
         request_metadata = RequestResponseMetadata(request_id=request_id)

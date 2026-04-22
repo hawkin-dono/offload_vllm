@@ -2054,6 +2054,7 @@ async def run_server_worker(
             engine_client.vllm_config.parallel_config._api_process_rank,
             listen_address,
         )
+        logger.info(f"hieuvt: vllm init here bro")
         shutdown_task = await serve_http(
             app,
             sock=sock,

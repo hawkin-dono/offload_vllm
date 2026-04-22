@@ -2792,6 +2792,7 @@ class GPUModelRunner(
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 batch_descriptor=batch_descriptor,
                 ubatch_slices=ubatch_slices,
+                req_ids=self.input_batch.req_ids,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
@@ -3850,6 +3851,7 @@ class GPUModelRunner(
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_descriptor,
                     ubatch_slices=ubatch_slices,
+                    req_ids=self.input_batch.req_ids,
                 ),
             ):
                 outputs = self.model(
