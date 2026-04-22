@@ -201,6 +201,7 @@ class Qwen3MoeMLP(nn.Module):
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         prefix: str = "",
+        layer_idx: int = 0,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -223,6 +224,7 @@ class Qwen3MoeMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self.layer_idx = layer_idx
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
@@ -236,6 +238,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self,
         vllm_config: VllmConfig,
         prefix: str = "",
+        layer_idx: int = 0,
     ):
         super().__init__()
 
@@ -249,7 +252,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.ep_rank = get_ep_group().rank_in_group
         self.ep_size = self.ep_group.size()
         self.n_routed_experts = config.num_experts
-
+        self.layer_idx = layer_idx
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
         if self.tp_size > config.num_experts:
@@ -296,7 +299,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.gate",
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, req_id: list[str], step: list[int]) -> torch.Tensor:
         assert hidden_states.dim() <= 2, (
             "Qwen3MoeSparseMoeBlock only supports 1D or 2D inputs"
         )
@@ -309,6 +312,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        
+        with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
+            expert_ids = torch.unique(torch.topk(router_logits, k=self.experts.top_k, dim=-1).indices).tolist()
+            f.write(f"[Grth] seq: {req_id}, step: {step}, layer_id: {self.layer_idx}, experts: {expert_ids}\n")
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
@@ -509,7 +516,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
             self.mlp = Qwen3MoeSparseMoeBlock(
-                vllm_config=vllm_config, prefix=f"{prefix}.mlp"
+                vllm_config=vllm_config, prefix=f"{prefix}.mlp", layer_idx=layer_idx
             )
         else:
             self.mlp = Qwen3MoeMLP(
@@ -518,6 +525,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
+                layer_idx=layer_idx,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -549,6 +557,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         # The output of the expert predictor, predicted_topk_ids is used to form a CPU tensor of size (num_predicted_experts, inter_dim, hidden_dim)
         # Then we copy this tensor to next layer's cache. How do we access next layer's cache here?
         next_layer = getattr(self, "next_layer", None)
+        running_context = get_running_context()
         if next_layer is not None and hidden_states.is_cuda:
             prefetch_stream = getattr(self, "_prefetch_stream", None)
             if prefetch_stream is None:
@@ -564,14 +573,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
             # 2) NOTE(hieuvt): handle seq_id
             moe = next_layer.mlp.experts
             with torch.profiler.record_function("ducct::expert_predictor"):
-                running_context = get_running_context()
-                predicted_ids = self.expert_predictor.predict_experts_batch(
-                    running_context[0], running_context[1], layer_ids= self.layer_id + 1)
-                with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
-                    for req, step in zip(running_context[0], running_context[1]):
-                        f.write(f"[GPU Layer] Request: {req} đang ở token thứ: {step}\n")
-
                 
+                predicted_ids = self.expert_predictor.predict_experts_batch(
+                    running_context[0], running_context[1], layer_ids= self.layer_id + 1, top_k=self.top_k)
+                with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
+                    # for req, step in zip(running_context[0], running_context[1]):
+                        # f.write(f"[GPU Layer] Request: {req} đang ở token thứ: {step}\n")
+                    f.write(f"[Predicted IDs] req: {running_context[0]}, step: {running_context[1]}, layer_id: {self.layer_id + 1}, predicted_ids: {predicted_ids}\n")
+
                 # )  # CPU
                 # predicted_ids = torch.tensor([0, 1, 2, 3], device="cpu")
 
@@ -602,7 +611,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, running_context[0], running_context[1])
         return hidden_states, residual
 
 
