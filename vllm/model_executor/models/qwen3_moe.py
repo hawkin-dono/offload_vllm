@@ -98,6 +98,52 @@ HIDDEN_STATE_FLUSH_EVERY_STEP = os.getenv(
 HIDDEN_STATE_TARGET_LAYER = os.getenv("HIDDEN_STATE_TARGET_LAYER")
 if HIDDEN_STATE_TARGET_LAYER is not None and HIDDEN_STATE_TARGET_LAYER != "":
     HIDDEN_STATE_TARGET_LAYER = int(HIDDEN_STATE_TARGET_LAYER)
+    
+import numpy as np 
+import h5py
+class GenerationTracker:
+    def __init__(self, filepath="vllm_hidden_states.h5"):
+        self.filepath = filepath
+        self.data = {}
+    
+    def log(self, req_ids, steps, layer_id, key, tensor):
+        if not req_ids or not steps:
+            return
+        req_id = req_ids[0]
+        req_id = req_id.split("-")[1]
+        step = steps[0]
+        if req_id not in self.data:
+            self.data[req_id] = {}
+        if step not in self.data[req_id]:
+            self.data[req_id][step] = {}
+        if layer_id not in self.data[req_id][step]:
+            self.data[req_id][step][layer_id] = {}
+            
+        if isinstance(tensor, torch.Tensor):
+            np_array = tensor.detach().cpu().to(torch.float16).numpy()
+        else:
+            np_array = np.array(tensor, dtype=np.float16)
+
+        self.data[req_id][step][layer_id][key] = np_array
+
+    def save_and_clear(self):
+        if not self.data:
+            return
+        
+        with h5py.File(self.filepath, 'a') as f:
+            for seq_id, steps in self.data.items():
+                seq_group = f.require_group(str(seq_id))
+                for step, layers in steps.items():
+                    step_group = seq_group.require_group(f"step_{step}")
+                    for layer_id, tensors in layers.items():
+                        layer_group = step_group.require_group(f"layer_{layer_id}")
+                        for key, np_array in tensors.items():
+                            if key in layer_group:
+                                del layer_group[key]
+                            layer_group.create_dataset(key, data=np_array, compression="lzf")
+        self.data.clear()
+
+global_tracker = GenerationTracker()
 
 class HiddenStateLogger:
     def __init__(
@@ -299,7 +345,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.gate",
         )
 
-    def forward(self, hidden_states: torch.Tensor, req_id: list[str], step: list[int]) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, req_ids: list[str], steps: list[int]) -> torch.Tensor:
         assert hidden_states.dim() <= 2, (
             "Qwen3MoeSparseMoeBlock only supports 1D or 2D inputs"
         )
@@ -313,9 +359,14 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         
-        with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
-            expert_ids = torch.unique(torch.topk(router_logits, k=self.experts.top_k, dim=-1).indices).tolist()
-            f.write(f"[Grth] seq: {req_id}, step: {step}, layer_id: {self.layer_idx}, experts: {expert_ids}\n")
+        # with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
+        #     expert_ids = torch.unique(torch.topk(router_logits, k=self.experts.top_k, dim=-1).indices).tolist()
+        #     f.write(f"[Grth] seq: {req_ids}, step: {step}, layer_id: {self.layer_idx}, experts: {expert_ids}\n")
+        
+        # --- LOG ROUTER LOGITS ---
+        
+        global_tracker.log(req_ids, steps, self.layer_idx, "router_logits", router_logits)
+        # -------------------------
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
@@ -508,7 +559,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         # `mlp_only_layers` in the config.
         layer_idx = extract_layer_index(prefix)
-        self.layer_id = layer_idx
+        self.layer_idx = layer_idx
         mlp_only_layers = (
             [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
         )
@@ -532,7 +583,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         # NOTE(ducct): add expert predictor
-        self.expert_predictor = OraclePredictor(data_path="/home/hieuvt/vllm-hpclab/dataset_generate/dataset_hidden_states.h5")
+        # self.expert_predictor = OraclePredictor(data_path="/home/hieuvt/vllm-hpclab/dataset_generate/dataset_hidden_states.h5")
         self.top_k = self.mlp.experts.top_k
 
 
@@ -543,21 +594,31 @@ class Qwen3MoeDecoderLayer(nn.Module):
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
+        running_context = get_running_context()
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            
+        # --- LOG ATTENTION INPUT ---
+        global_tracker.log(running_context[0], running_context[1], self.layer_idx, "attention_input", hidden_states)
+        # ---------------------------
+        
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
+        
+        # --- LOG ATTENTION OUTPUT ---
+        global_tracker.log(running_context[0], running_context[1], self.layer_idx, "attention_output", hidden_states)
+        # ----------------------------
+        
         # TODO(ducct): Predict + prefetch expert weights for next layer here only if you want to prefectch after attn
         # predictor runs on CPU -> transfer hidden_states back to CPU for computation
         # The output of the expert predictor, predicted_topk_ids is used to form a CPU tensor of size (num_predicted_experts, inter_dim, hidden_dim)
         # Then we copy this tensor to next layer's cache. How do we access next layer's cache here?
         next_layer = getattr(self, "next_layer", None)
-        running_context = get_running_context()
         if next_layer is not None and hidden_states.is_cuda:
             prefetch_stream = getattr(self, "_prefetch_stream", None)
             if prefetch_stream is None:
@@ -574,15 +635,15 @@ class Qwen3MoeDecoderLayer(nn.Module):
             moe = next_layer.mlp.experts
             with torch.profiler.record_function("ducct::expert_predictor"):
                 
-                predicted_ids = self.expert_predictor.predict_experts_batch(
-                    running_context[0], running_context[1], layer_ids= self.layer_id + 1, top_k=self.top_k)
-                with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
-                    # for req, step in zip(running_context[0], running_context[1]):
-                        # f.write(f"[GPU Layer] Request: {req} đang ở token thứ: {step}\n")
-                    f.write(f"[Predicted IDs] req: {running_context[0]}, step: {running_context[1]}, layer_id: {self.layer_id + 1}, predicted_ids: {predicted_ids}\n")
+                # predicted_ids = self.expert_predictor.predict_experts_batch(
+                #     running_context[0], running_context[1], layer_ids= self.layer_id + 1, top_k=self.top_k)
+                # with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
+                #     # for req, step in zip(running_context[0], running_context[1]):
+                #         # f.write(f"[GPU Layer] Request: {req} đang ở token thứ: {step}\n")
+                #     f.write(f"[Predicted IDs] req: {running_context[0]}, step: {running_context[1]}, layer_id: {self.layer_id + 1}, predicted_ids: {predicted_ids}\n")
 
                 # )  # CPU
-                # predicted_ids = torch.tensor([0, 1, 2, 3], device="cpu")
+                predicted_ids = torch.tensor([0, 1, 2, 3], device="cpu")
 
             # NOTE(ducct):Normalize predicted ids to a unique 1D list (cache expects <= num_experts).
             # with torch.profiler.record_function("expert_ids.check_and_normalize"):
@@ -693,6 +754,7 @@ class Qwen3MoeModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         # NOTE(ducct):
+        running_context = get_running_context()
         if ENABLE_HIDDEN_STATE_DUMP:
             self._hidden_state_step += 1
             hidden_state_step = self._hidden_state_step
@@ -703,6 +765,10 @@ class Qwen3MoeModel(nn.Module):
             else:
                 hidden_states = self.embed_input_ids(input_ids)
             residual = None
+            
+            # --- LOG EMBEDDING ---
+            global_tracker.log(running_context[0], running_context[1], "embed", "embedding", hidden_states)
+            # ---------------------
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
@@ -757,12 +823,14 @@ class Qwen3MoeModel(nn.Module):
                 )
 
         if not get_pp_group().is_last_rank:
+            global_tracker.save_and_clear()
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm(hidden_states, residual)
 
         # Return auxiliary hidden states if collected
+        global_tracker.save_and_clear()
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states
