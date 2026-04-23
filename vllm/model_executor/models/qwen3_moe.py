@@ -81,7 +81,8 @@ import os
 from typing import Dict, List 
 from pathlib import Path
 
-from vllm.model_executor.layers.expert_prefetch import ExpertPredictorModel, ExpertCache, OraclePredictor
+from vllm.model_executor.layers.expert_prefetch import ExpertMapStore, ExpertPredictorModel, ExpertCache, OraclePredictor
+from vllm.model_executor.layers.expert_prefetch import ExpertTracer, ExpertMapMatcher
 from vllm.forward_context import get_forward_context
 
 # Hidden-state dump (for correctness checks)
@@ -239,6 +240,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         vllm_config: VllmConfig,
         prefix: str = "",
         layer_idx: int = 0,
+        expert_map_matcher: ExpertMapMatcher = None,
+        expert_tracer: ExpertTracer = None,
     ):
         super().__init__()
 
@@ -303,6 +306,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         assert hidden_states.dim() <= 2, (
             "Qwen3MoeSparseMoeBlock only supports 1D or 2D inputs"
         )
+        run_context = get_running_context()
         is_input_1d = hidden_states.dim() == 1
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -312,6 +316,15 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        selected_experts = torch.topk(router_logits, k=self.experts.top_k, dim=-1).indices
+        
+        for i, seq_id in enumerate(run_context[0]):
+            self.expert_tracer.update_entry(
+                seq_id = seq_id, 
+                expert_list = selected_experts[i].tolist(), 
+                layer_idx = self.layer_idx, 
+                expert_probs = router_logits[i].tolist() 
+            )
         
         with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
             expert_ids = torch.unique(torch.topk(router_logits, k=self.experts.top_k, dim=-1).indices).tolist()
@@ -476,7 +489,7 @@ def get_running_context():
     return ([], [])
     
 class Qwen3MoeDecoderLayer(nn.Module):
-    def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
+    def __init__(self, vllm_config: VllmConfig, prefix: str = "", expert_tracer: ExpertTracer = None) -> None:
         super().__init__()
 
         config = vllm_config.model_config.hf_text_config
@@ -505,6 +518,13 @@ class Qwen3MoeDecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
             dual_chunk_attention_config=dual_chunk_attention_config,
         )
+        
+        next_layer = getattr(self, "next_layer", None)
+        expert_prefetcher = next_layer.mlp.experts.expert_cache
+        self.expert_map_matcher = ExpertMapMatcher(expert_tracer=expert_tracer, 
+                                                   expert_map_store=self.expert_map_store, 
+                                                   expert_prefetcher= expert_prefetcher, 
+                                                   prefetch_distance=1)
 
         # `mlp_only_layers` in the config.
         layer_idx = extract_layer_index(prefix)
@@ -515,8 +535,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
         if (layer_idx not in mlp_only_layers) and (
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
+            
             self.mlp = Qwen3MoeSparseMoeBlock(
-                vllm_config=vllm_config, prefix=f"{prefix}.mlp", layer_idx=layer_idx
+                vllm_config=vllm_config, prefix=f"{prefix}.mlp", layer_idx=layer_idx, expert_tracer=expert_tracer, expert_map_matcher=self.expert_map_matcher
             )
         else:
             self.mlp = Qwen3MoeMLP(
@@ -559,10 +580,10 @@ class Qwen3MoeDecoderLayer(nn.Module):
         next_layer = getattr(self, "next_layer", None)
         running_context = get_running_context()
         if next_layer is not None and hidden_states.is_cuda:
-            prefetch_stream = getattr(self, "_prefetch_stream", None)
-            if prefetch_stream is None:
-                self._prefetch_stream = torch.cuda.Stream()
-                prefetch_stream = self._prefetch_stream
+            # prefetch_stream = getattr(self, "_prefetch_stream", None)
+            # if prefetch_stream is None:
+            #     self._prefetch_stream = torch.cuda.Stream()
+            #     prefetch_stream = self._prefetch_stream
 
             # # 1) D2H copy on prefetch stream
             # # with torch.profiler.record_function("expert_prefetch.d2h_hidden_states"):
@@ -604,9 +625,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
                     inactive_bf = moe.expert_cache.get_inactive_buffer()
                     inactive_bf.fetch_on_demand(moe, predicted_ids)
 
-            with torch.cuda.stream(prefetch_stream):
-                with torch.profiler.record_function("ducct::prefetch"):
-                    moe.expert_cache.prefetch(predicted_ids, prefetch_fn=do_prefetch, stream=prefetch_stream)
+            # with torch.cuda.stream(prefetch_stream):
+            #     with torch.profiler.record_function("ducct::prefetch"):
+            #         moe.expert_cache.prefetch(predicted_ids, prefetch_fn=do_prefetch, stream=prefetch_stream)
 
 
         # Fully Connected
@@ -629,6 +650,11 @@ class Qwen3MoeModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.config = config
+        
+        self.expert_map_store = ExpertMapStore(capacity=1000, config=config, device="cpu")
+        self.expert_tracer = ExpertTracer(capacity=1000, config=config, expert_map_store=self.expert_map_store, eval_mode="online", device="cpu")
+        
+        
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -637,9 +663,10 @@ class Qwen3MoeModel(nn.Module):
         )
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: Qwen3MoeDecoderLayer(vllm_config=vllm_config, prefix=prefix),
+            lambda prefix: Qwen3MoeDecoderLayer(vllm_config=vllm_config, prefix=prefix, expert_tracer=self.expert_tracer),
             prefix=f"{prefix}.layers",
         )
+        
 
         # NOTE(ducct): Link neighboring layers without registering as submodules.
         for i, layer in enumerate(self.layers):
@@ -652,6 +679,11 @@ class Qwen3MoeModel(nn.Module):
         self.expert_cache = ExpertCache(
             num_experts=self.config.num_experts
         )
+        
+        self.embed_expert_map_matcher = ExpertMapMatcher(expert_tracer=self.expert_tracer, 
+                                                   expert_map_store=self.expert_map_store, 
+                                                   expert_prefetcher= self.start_layer.mlp.experts.expert_cache, 
+                                                   prefetch_distance=1)
 
         owner_fused_moe = next(
             (
@@ -678,8 +710,6 @@ class Qwen3MoeModel(nn.Module):
         )
         # Track layers for auxiliary hidden state outputs (EAGLE3)
         self.aux_hidden_state_layers: tuple[int, ...] = ()
-        # NOTE(ducct): 
-        self._hidden_state_step = 0
 
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -693,9 +723,7 @@ class Qwen3MoeModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         # NOTE(ducct):
-        if ENABLE_HIDDEN_STATE_DUMP:
-            self._hidden_state_step += 1
-            hidden_state_step = self._hidden_state_step
+        run_context = get_running_context()
 
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -703,6 +731,11 @@ class Qwen3MoeModel(nn.Module):
             else:
                 hidden_states = self.embed_input_ids(input_ids)
             residual = None
+            
+            for seq_id in run_context[0]:
+                self.expert_tracer.create_entry(seq_id)
+            
+                self.expert_map_matcher.prefetch(seq_id, hidden_states, "embed")
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
@@ -761,6 +794,8 @@ class Qwen3MoeModel(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm(hidden_states, residual)
+        
+        self.expert_tracer.finish_entry(run_context[0])  
 
         # Return auxiliary hidden states if collected
         if len(aux_hidden_states) > 0:
