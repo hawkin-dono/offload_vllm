@@ -532,7 +532,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         # NOTE(ducct): add expert predictor
-        self.expert_predictor = OraclePredictor(data_path="/home/hieuvt/vllm-hpclab/dataset_generate/dataset_hidden_states.h5")
+        self.expert_predictor = OraclePredictor(data_path="/home/hieuvt/vllm-hpclab/vllm_hidden_states.h5")
         self.top_k = self.mlp.experts.top_k
 
 
@@ -576,6 +576,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 
                 predicted_ids = self.expert_predictor.predict_experts_batch(
                     running_context[0], running_context[1], layer_ids= self.layer_id + 1, top_k=self.top_k)
+                predicted_ids = predicted_ids.reshape(-1)
+                predicted_ids = torch.unique(predicted_ids)
                 with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
                     # for req, step in zip(running_context[0], running_context[1]):
                         # f.write(f"[GPU Layer] Request: {req} đang ở token thứ: {step}\n")
@@ -583,11 +585,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
                 # )  # CPU
                 # predicted_ids = torch.tensor([0, 1, 2, 3], device="cpu")
-
             # NOTE(ducct):Normalize predicted ids to a unique 1D list (cache expects <= num_experts).
             # with torch.profiler.record_function("expert_ids.check_and_normalize"):
-            predicted_ids = predicted_ids.reshape(-1)
-            predicted_ids = torch.unique(predicted_ids)
+            
             max_cache = moe.expert_cache.ping_buffer.w13_weight.shape[0]
             if predicted_ids.numel() > max_cache:
                 predicted_ids = predicted_ids[:max_cache]
