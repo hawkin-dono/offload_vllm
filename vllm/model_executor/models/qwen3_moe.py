@@ -191,6 +191,73 @@ hidden_state_logger = HiddenStateLogger(
 
 logger = init_logger(__name__)
 
+class AccuracyTracker:
+    def __init__(self):
+        self.grth = {}
+        self.predicted = {}
+        self.total_true = 0
+        self.total_grth = 0
+
+    def _make_key(self, req_ids, steps, layer_id):
+        if isinstance(req_ids, list):
+            req_ids = tuple(req_ids)
+        if isinstance(steps, list):
+            steps = tuple(steps)
+        elif isinstance(steps, torch.Tensor):
+            steps = tuple(steps.tolist())
+        return (req_ids, steps, layer_id)
+
+    def log_grth(self, req_ids, steps, layer_id, expert_ids):
+        key = self._make_key(req_ids, steps, layer_id)
+        if isinstance(expert_ids, torch.Tensor):
+            expert_ids = expert_ids.tolist()
+        elif not isinstance(expert_ids, list):
+            expert_ids = list(expert_ids)
+            
+        self.grth[key] = expert_ids
+        if key in self.predicted:
+            pred_ids = self.predicted[key]
+            set_grth = set(expert_ids)
+            set_pred = set(pred_ids)
+            
+            overlap = len(set_grth.intersection(set_pred))
+            self.total_true += overlap
+            self.total_grth += len(set_grth)
+            
+            if set_grth != set_pred:
+                with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
+                    f.write(f"[Mismatch] key: {key}, grth: {expert_ids}, pred: {pred_ids}\n")
+            
+            acc = self.total_true / self.total_grth if self.total_grth > 0 else 0.0
+            with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
+                f.write(f"[Accuracy] Overall Accuracy: {acc:.4f} (Overlap: {self.total_true}, Total Grth: {self.total_grth})\n")
+
+    def log_predicted(self, req_ids, steps, layer_id, predicted_ids):
+        key = self._make_key(req_ids, steps, layer_id)
+        if isinstance(predicted_ids, torch.Tensor):
+            predicted_ids = predicted_ids.tolist()
+        elif not isinstance(predicted_ids, list):
+            predicted_ids = list(predicted_ids)
+            
+        self.predicted[key] = predicted_ids
+        
+        if key in self.grth:
+            g_ids = self.grth[key]
+            set_g = set(g_ids)
+            set_p = set(predicted_ids)
+            
+            overlap = len(set_g.intersection(set_p))
+            self.total_true += overlap
+            self.total_grth += len(set_g)
+            
+            acc = self.total_true / self.total_grth if self.total_grth > 0 else 0.0
+            if overlap != len(set_g):
+                with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
+                    f.write(f"[Mismatch] key: {key}, grth: {g_ids}, pred: {predicted_ids}\n")
+
+accuracy_tracker = AccuracyTracker()
+
+
 
 class Qwen3MoeMLP(nn.Module):
     def __init__(
@@ -313,9 +380,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         
-        with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
-            expert_ids = torch.unique(torch.topk(router_logits, k=self.experts.top_k, dim=-1).indices).tolist()
-            f.write(f"[Grth] seq: {req_id}, step: {step}, layer_id: {self.layer_idx}, experts: {expert_ids}\n")
+        expert_ids = torch.unique(torch.topk(router_logits, k=self.experts.top_k, dim=-1).indices).tolist()
+        accuracy_tracker.log_grth(req_id, step, self.layer_idx, expert_ids)
+        
+        # with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
+        #     f.write(f"[Grth] seq: {req_id}, step: {step}, layer_id: {self.layer_idx}, experts: {expert_ids}\n")
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
@@ -532,9 +601,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         # NOTE(ducct): add expert predictor
-        self.expert_predictor = OraclePredictor(data_path="/home/hieuvt/vllm-hpclab/vllm_hidden_states.h5")
         self.top_k = self.mlp.experts.top_k
-
+        self.expert_predictor = OraclePredictor(data_path="/home/hieuvt/vllm-hpclab/vllm_hidden_states.h5", top_k=self.top_k, device="cpu")
 
     def forward(
         self,
@@ -575,13 +643,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
             with torch.profiler.record_function("ducct::expert_predictor"):
                 
                 predicted_ids = self.expert_predictor.predict_experts_batch(
-                    running_context[0], running_context[1], layer_ids= self.layer_id + 1, top_k=self.top_k)
+                    running_context[0], running_context[1], layer_ids= self.layer_id + 1)
                 predicted_ids = predicted_ids.reshape(-1)
                 predicted_ids = torch.unique(predicted_ids)
-                with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
-                    # for req, step in zip(running_context[0], running_context[1]):
-                        # f.write(f"[GPU Layer] Request: {req} đang ở token thứ: {step}\n")
-                    f.write(f"[Predicted IDs] req: {running_context[0]}, step: {running_context[1]}, layer_id: {self.layer_id + 1}, predicted_ids: {predicted_ids}\n")
+                accuracy_tracker.log_predicted(running_context[0], running_context[1], self.layer_id + 1, predicted_ids)
+                # with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
+                #     # for req, step in zip(running_context[0], running_context[1]):
+                #         # f.write(f"[GPU Layer] Request: {req} đang ở token thứ: {step}\n")
+                #     f.write(f"[Predicted IDs] req: {running_context[0]}, step: {running_context[1]}, layer_id: {self.layer_id + 1}, predicted_ids: {predicted_ids.tolist()}\n")
 
                 # )  # CPU
                 # predicted_ids = torch.tensor([0, 1, 2, 3], device="cpu")
@@ -594,10 +663,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
             # with torch.profiler.record_function("expert_ids.h2d_cache_ids"):
             if moe.expert_cache.active_buffer == "ping":
-                moe.cached_expert_ids_pong = predicted_ids.detach().to("cuda")
+                moe.cached_expert_ids_pong = predicted_ids
             else:
-                moe.cached_expert_ids_ping = predicted_ids.detach().to("cuda")
-
+                moe.cached_expert_ids_ping = predicted_ids
             # 3) H2D prefetch on prefetch stream
             def do_prefetch():
                 # with torch.profiler.record_function("expert_prefetch.fetch_on_demand"):

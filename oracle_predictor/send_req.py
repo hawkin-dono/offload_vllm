@@ -39,7 +39,8 @@ def send_single_request(idx, total, item, api_url, model_name):
         return False
 
 def main():
-    api_url = "http://localhost:8000/v1/completions"
+    port = 8080
+    api_url = f"http://localhost:{port}/v1/completions"
     model_name = "/dev/shm/Qwen3-30B-A3B"
     dataset_path = "dataset_generate/sharegpt_128_test.json"
     
@@ -54,7 +55,7 @@ def main():
     except Exception as e:
         print(f"Lỗi khi đọc file: {e}")
         return
-
+    # dataset = dataset[:1]
     total_reqs = len(dataset)
     print(f"Tổng số requests cần gửi: {total_reqs}")
     print(f"Số luồng chạy song song (max_workers): {max_workers}")

@@ -138,7 +138,7 @@ class ExpertBuffer(nn.Module):
         # Map global expert ids -> local expert ids when EP is enabled.
         # Filter out experts not owned by this rank (mapped to -1).
         # with torch.profiler.record_function("expert_ids.map_and_filter"):
-        if getattr(layer, "expert_map", None) is not None:
+        if getattr(layer, "expert_map", None) is not None:  #not matter, since run on 1 device
             map_device = layer.expert_map.device
             local_ids = layer.expert_map[
                 expert_ids.to(map_device, dtype=torch.long)
