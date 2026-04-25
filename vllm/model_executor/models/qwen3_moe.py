@@ -81,7 +81,7 @@ import os
 from typing import Dict, List 
 from pathlib import Path
 
-from vllm.model_executor.layers.expert_prefetch import ExpertPredictorModel, ExpertCache, OraclePredictor
+from vllm.model_executor.layers.expert_prefetch import ExpertPredictorModel, ExpertCache
 from vllm.forward_context import get_forward_context
 
 # Hidden-state dump (for correctness checks)
@@ -107,24 +107,28 @@ class GenerationTracker:
         self.data = {}
     
     def log(self, req_ids, steps, layer_id, key, tensor):
+        if isinstance(req_ids, torch.Tensor):
+            req_ids = req_ids.tolist()
+        if isinstance(steps, torch.Tensor):
+            steps = steps.tolist()
         if not req_ids or not steps:
             return
-        req_id = req_ids[0]
-        req_id = req_id.split("-")[1]
-        step = steps[0]
-        if req_id not in self.data:
-            self.data[req_id] = {}
-        if step not in self.data[req_id]:
-            self.data[req_id][step] = {}
-        if layer_id not in self.data[req_id][step]:
-            self.data[req_id][step][layer_id] = {}
-            
+        
         if isinstance(tensor, torch.Tensor):
             np_array = tensor.detach().cpu().to(torch.float16).numpy()
         else:
             np_array = np.array(tensor, dtype=np.float16)
-
-        self.data[req_id][step][layer_id][key] = np_array
+    
+        for i, (req_id, step) in enumerate(zip(req_ids, steps)):
+            true_req_id = req_id.split("-")[1]
+            if true_req_id not in self.data:
+                self.data[true_req_id] = {}
+            if step not in self.data[true_req_id]:
+                self.data[true_req_id][step] = {}
+            if layer_id not in self.data[true_req_id][step]:
+                self.data[true_req_id][step][layer_id] = {}
+            current_data = np_array[i]
+            self.data[true_req_id][step][layer_id][key] = current_data
 
     def save_and_clear(self):
         if not self.data:
