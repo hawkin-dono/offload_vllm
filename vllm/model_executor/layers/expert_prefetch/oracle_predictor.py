@@ -51,7 +51,12 @@ class OraclePredictor:
         # print(f"get steps: {steps}")
         for seq_id, step in zip(seq_ids, steps):
             # cmpl-seq_001-0 -> seq_001
-            true_seq_id = seq_id.split("-")[1]
+            # Handle both cmpl-seq_001-0 and seq_001-0 formats
+            if seq_id.startswith("cmpl-") or seq_id.startswith("chatcmpl-"):
+                true_seq_id = seq_id.split("-")[1]
+            else:
+                true_seq_id = seq_id.split("-")[0]
+            
             # Convert step to int in case it's a PyTorch tensor, 
             # since tensors have different hash/equality in dict keys than plain ints.
             step_val = int(step)

@@ -1,0 +1,53 @@
+[
+    {
+        "successful_requests": 8,
+        "benchmark_duration_s": 680.3869462013245,
+        "total_input_tokens": 461,
+        "total_generated_tokens": null,
+        "request_throughput": 0.011758015118698095,
+        "output_token_throughput": 0.7525129675966781,
+        "mean_ttft_ms": 301740.3777523432,
+        "median_ttft_ms": 298772.9178275913,
+        "p99_ttft_ms": 597150.32204004,
+        "mean_tpot_ms": 1229.854727097388,
+        "median_tpot_ms": 1229.8984682512662,
+        "p99_tpot_ms": 1230.202519215998,
+        "mean_itl_ms": 1229.8547320496587,
+        "median_itl_ms": 1229.2942274361849,
+        "p99_itl_ms": 1235.1707962714136
+    },
+    {
+        "successful_requests": 4,
+        "benchmark_duration_s": 333.6633335798979,
+        "total_input_tokens": 69,
+        "total_generated_tokens": null,
+        "request_throughput": 0.011988131740709153,
+        "output_token_throughput": 0.7672404314053858,
+        "mean_ttft_ms": 130884.50307911262,
+        "median_ttft_ms": 131250.43685454875,
+        "p99_ttft_ms": 253639.17005894703,
+        "mean_tpot_ms": 1230.5089576716814,
+        "median_tpot_ms": 1230.3982694884614,
+        "p99_tpot_ms": 1231.0357715423027,
+        "mean_itl_ms": 1230.5089675762233,
+        "median_itl_ms": 1229.930025525391,
+        "p99_itl_ms": 1235.8356717415154
+    },
+    {
+        "successful_requests": 16,
+        "benchmark_duration_s": 1370.425144750625,
+        "total_input_tokens": 1099,
+        "total_generated_tokens": null,
+        "request_throughput": 0.011675209011807432,
+        "output_token_throughput": 0.7472133767556757,
+        "mean_ttft_ms": 648424.8258584412,
+        "median_ttft_ms": 649396.7054840177,
+        "p99_ttft_ms": 1280105.8196972124,
+        "mean_tpot_ms": 1230.3798157751326,
+        "median_tpot_ms": 1230.206549936344,
+        "p99_tpot_ms": 1231.6543831460415,
+        "mean_itl_ms": 1230.379820490877,
+        "median_itl_ms": 1229.561653919518,
+        "p99_itl_ms": 1237.8300573304296
+    }
+]

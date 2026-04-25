@@ -349,8 +349,8 @@ class ResponsesRequest(OpenAIBaseModel):
     user: str | None = None
 
     # --8<-- [start:responses-extra-params]
-    request_id: str = Field(
-        default_factory=lambda: f"resp_{random_uuid()}",
+    request_id: str | None = Field(
+        default=None,
         description=(
             "The request_id related to this request. If the caller does "
             "not set it, a random_uuid will be generated. This id is used "

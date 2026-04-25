@@ -381,7 +381,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         router_logits, _ = self.gate(hidden_states)
         
         expert_ids = torch.unique(torch.topk(router_logits, k=self.experts.top_k, dim=-1).indices).tolist()
-        accuracy_tracker.log_grth(req_id, step, self.layer_idx, expert_ids)
+        # accuracy_tracker.log_grth(req_id, step, self.layer_idx, expert_ids)
         
         # with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
         #     f.write(f"[Grth] seq: {req_id}, step: {step}, layer_id: {self.layer_idx}, experts: {expert_ids}\n")
@@ -646,7 +646,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
                     running_context[0], running_context[1], layer_ids= self.layer_id + 1)
                 predicted_ids = predicted_ids.reshape(-1)
                 predicted_ids = torch.unique(predicted_ids)
-                accuracy_tracker.log_predicted(running_context[0], running_context[1], self.layer_id + 1, predicted_ids)
+                # accuracy_tracker.log_predicted(running_context[0], running_context[1], self.layer_id + 1, predicted_ids)
                 # with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
                 #     # for req, step in zip(running_context[0], running_context[1]):
                 #         # f.write(f"[GPU Layer] Request: {req} đang ở token thứ: {step}\n")
@@ -816,13 +816,13 @@ class Qwen3MoeModel(nn.Module):
                     }
                     for param_name in self.expert_cache.cached_parameter_names:
                         cached_weights[param_name] = getattr(active_buffer, param_name)
-                hidden_state_logger.log(
-                    step=hidden_state_step,
-                    layer_id=layer_idx,
-                    tensor=hidden,
-                    device=hidden.device,
-                    cached_weights=cached_weights,
-                )
+                # hidden_state_logger.log(
+                #     step=hidden_state_step,
+                #     layer_id=layer_idx,
+                #     tensor=hidden,
+                #     device=hidden.device,
+                #     cached_weights=cached_weights,
+                # )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(

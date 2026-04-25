@@ -10,6 +10,8 @@ from vllm.model_executor.layers.expert_prefetch.expert_predictor import (
     ExpertPredictorModel,
 )
 
+from vllm.model_executor.layers.expert_prefetch.oracle_predictor import OraclePredictor
+
 _config: dict[str, Any] | None = None
 
 
