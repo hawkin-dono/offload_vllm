@@ -85,6 +85,7 @@ from vllm.model_executor.layers.expert_prefetch import ExpertPredictorModel, Exp
 from vllm.forward_context import get_forward_context
 
 # Hidden-state dump (for correctness checks)
+ENABLE_ACCURACY_TRACKING = os.getenv("ENABLE_ACCURACY_TRACKING", "0") == "1"
 ENABLE_HIDDEN_STATE_DUMP = os.getenv("ENABLE_HIDDEN_STATE_DUMP", "0") == "1"
 HIDDEN_STATE_LOG_DIR = Path(
     os.getenv("HIDDEN_STATE_LOG_DIR", "/tmp/hieuvt/logs/hidden_state/vllm-pref")
@@ -197,6 +198,15 @@ class AccuracyTracker:
         self.predicted = {}
         self.total_true = 0
         self.total_grth = 0
+        
+    def check_dummy_req(self, req_ids: list[str]) -> bool:
+        if not req_ids:
+            return True
+        req_id = req_ids[0]
+        if req_id.startswith("cmpl") or req_id.startswith("chatcmpl"):
+            req_id = req_id.split("-")[1] 
+        if len(req_id) >= 8: 
+            return True
 
     def _make_key(self, req_ids, steps, layer_id):
         if isinstance(req_ids, list):
@@ -208,6 +218,8 @@ class AccuracyTracker:
         return (req_ids, steps, layer_id)
 
     def log_grth(self, req_ids, steps, layer_id, expert_ids):
+        if self.check_dummy_req(req_ids):
+            return 
         key = self._make_key(req_ids, steps, layer_id)
         if isinstance(expert_ids, torch.Tensor):
             expert_ids = expert_ids.tolist()
@@ -226,35 +238,30 @@ class AccuracyTracker:
             
             if set_grth != set_pred:
                 with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
-                    f.write(f"[Mismatch] key: {key}, grth: {expert_ids}, pred: {pred_ids}\n")
+                    f.write(f"[Mismatch] key: {key}, grth: {expert_ids}, pred: {pred_ids}\n, acc: {overlap / len(set_grth):.4f} \n")
+            else: 
+                with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
+                    f.write(f"[Match] key: {key}, experts: {pred_ids}\n")
             
-            acc = self.total_true / self.total_grth if self.total_grth > 0 else 0.0
-            with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
-                f.write(f"[Accuracy] Overall Accuracy: {acc:.4f} (Overlap: {self.total_true}, Total Grth: {self.total_grth})\n")
-
+            
     def log_predicted(self, req_ids, steps, layer_id, predicted_ids):
+        if self.check_dummy_req(req_ids):
+            return
         key = self._make_key(req_ids, steps, layer_id)
         if isinstance(predicted_ids, torch.Tensor):
             predicted_ids = predicted_ids.tolist()
         elif not isinstance(predicted_ids, list):
             predicted_ids = list(predicted_ids)
             
+        acc = self.total_true / self.total_grth if self.total_grth > 0 else 0.0
+            
+        if key not in self.predicted:
+            with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
+                f.write(f"[Accuracy] Overall Accuracy: {acc:.4f} (Overlap: {self.total_true}, Total Grth: {self.total_grth})\n")
+            
         self.predicted[key] = predicted_ids
         
-        if key in self.grth:
-            g_ids = self.grth[key]
-            set_g = set(g_ids)
-            set_p = set(predicted_ids)
-            
-            overlap = len(set_g.intersection(set_p))
-            self.total_true += overlap
-            self.total_grth += len(set_g)
-            
-            acc = self.total_true / self.total_grth if self.total_grth > 0 else 0.0
-            if overlap != len(set_g):
-                with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
-                    f.write(f"[Mismatch] key: {key}, grth: {g_ids}, pred: {predicted_ids}\n")
-
+        
 accuracy_tracker = AccuracyTracker()
 
 
@@ -381,7 +388,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         router_logits, _ = self.gate(hidden_states)
         
         expert_ids = torch.unique(torch.topk(router_logits, k=self.experts.top_k, dim=-1).indices).tolist()
-        # accuracy_tracker.log_grth(req_id, step, self.layer_idx, expert_ids)
+        if ENABLE_ACCURACY_TRACKING:
+            accuracy_tracker.log_grth(req_id, step, self.layer_idx, expert_ids)
         
         # with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
         #     f.write(f"[Grth] seq: {req_id}, step: {step}, layer_id: {self.layer_idx}, experts: {expert_ids}\n")
@@ -602,7 +610,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
         # NOTE(ducct): add expert predictor
         self.top_k = self.mlp.experts.top_k
-        self.expert_predictor = OraclePredictor(data_path="/home/hieuvt/vllm-hpclab/vllm_hidden_states.h5", top_k=self.top_k, device="cpu")
+        self.expert_predictor = OraclePredictor(data_path="/home/hieuvt/vllm-hpclab/vllm_hidden_states_1seq.h5", top_k=self.top_k, device="cpu")
 
     def forward(
         self,
@@ -646,7 +654,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
                     running_context[0], running_context[1], layer_ids= self.layer_id + 1)
                 predicted_ids = predicted_ids.reshape(-1)
                 predicted_ids = torch.unique(predicted_ids)
-                # accuracy_tracker.log_predicted(running_context[0], running_context[1], self.layer_id + 1, predicted_ids)
+                if ENABLE_ACCURACY_TRACKING:
+                    accuracy_tracker.log_predicted(running_context[0], running_context[1], self.layer_id + 1, predicted_ids)
                 # with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
                 #     # for req, step in zip(running_context[0], running_context[1]):
                 #         # f.write(f"[GPU Layer] Request: {req} đang ở token thứ: {step}\n")

@@ -42,6 +42,9 @@ else:
 
 logger = init_logger(__name__)
 
+import os 
+ENABLE_ACCURACY_TRACKING = os.getenv("ENABLE_ACCURACY_TRACKING", "0") == "1"
+
 
 @CustomOp.register("unquantized_fused_moe")
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
@@ -411,17 +414,18 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             inactive_cache = layer.expert_cache.get_inactive_buffer()
             if layer.expert_cache.active_buffer == "ping":
                 # NOTE(ducct): temporary fix
-                layer.cached_expert_ids_ping = torch.empty(0, dtype=torch.int32, device="cuda")
+                # layer.cached_expert_ids_ping = torch.empty(0, dtype=torch.int32, device="cuda")
                 cached_expert_ids = layer.cached_expert_ids_ping
                 #layer.cached_expert_ids_ping = torch.empty(0, dtype=torch.int32, device="cuda")
 
             else:
                 # NOTE(ducct):temporary fix
-                layer.cached_expert_ids_pong = torch.empty(0, dtype=torch.int32, device="cuda")
+                # layer.cached_expert_ids_pong = torch.empty(0, dtype=torch.int32, device="cuda")
                 cached_expert_ids = layer.cached_expert_ids_pong
                 #layer.cached_expert_ids_pong = torch.empty(0, dtype=torch.int32, device="cuda")
             # 2. Transfer the topk_ids from GPU to CPU to compare with cached_expert_ids: done
-            unique_selected_ids = torch.unique(topk_ids.reshape(-1))
+            unique_selected_ids = torch.unique(topk_ids.reshape(-1)).to(cached_expert_ids.device) 
+
             # 3. Do the checking on GPU
             expert_mask = torch.isin(unique_selected_ids, cached_expert_ids, assume_unique=True) # check if unique_selected_ids is subset of cached_expert_ids
             is_subset = expert_mask.all().item()
@@ -431,7 +435,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 cached_expert_ids = unique_selected_ids
                 # 4. if there is missing ids in predicted ids, fetch to GPU on demand
                 # NOTE(ducct): fetch on-demand missing experts into the cache. 
-                active_cache.fetch_on_demand(layer, cached_expert_ids.to("cpu"))
+                active_cache.fetch_on_demand(layer, cached_expert_ids.to("cpu"))  
+                if ENABLE_ACCURACY_TRACKING:
+                    with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
+                        f.write(f"[Cache Miss] missing expert ids: {missing_values.cpu().tolist()} \n")
 
             # OLD: map expert IDs -> cache slot indices from cached_expert_ids.
             # num_experts = getattr(layer, "num_experts", None) or layer.global_num_experts

@@ -112,7 +112,11 @@ class OpenAIServingCompletion(OpenAIServing):
                 "prompt_logprobs is not compatible with prompt embeds."
             )
 
-        request_id = f"cmpl-{self._base_request_id(raw_request, request.request_id)}"
+        base_id = self._base_request_id(raw_request, request.request_id)
+        if base_id.startswith("cmpl-"):
+            request_id = base_id
+        else:
+            request_id = f"cmpl-{base_id}"
         logger.info(f"[hieuvt]: i catch a request_id here bro: {request_id}")
         created_time = int(time.time())
 

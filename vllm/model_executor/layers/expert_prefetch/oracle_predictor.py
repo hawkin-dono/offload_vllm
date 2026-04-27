@@ -30,7 +30,10 @@ class OraclePredictor:
                     
                     for layer_key in f[seq_id][step_key].keys():
                         if not layer_key.startswith("layer_"): continue
-                        layer_idx = str(layer_key.split("_")[1])
+                        try:
+                            layer_idx = int(layer_key.split("_")[1])
+                        except Exception as e:
+                            continue
                         
                         path = f"{seq_id}/{step_key}/{layer_key}/router_logits"
                         if path in f:
@@ -61,7 +64,7 @@ class OraclePredictor:
             # since tensors have different hash/equality in dict keys than plain ints.
             step_val = int(step)
                 
-            data = OraclePredictor.cache.get((true_seq_id, step_val, str(layer_ids)))
+            data = OraclePredictor.cache.get((true_seq_id, step_val, layer_ids))
             if data is not None:
                 predictions.append(data)
         if not predictions:

@@ -151,7 +151,7 @@ class ExpertBuffer(nn.Module):
             local_ids = expert_ids
 
         # with torch.profiler.record_function("expert_ids.to_device"):
-        local_ids = local_ids.to(layer.w13_weight.device, dtype=torch.long)
+        # local_ids = local_ids.to(layer.w13_weight.device, dtype=torch.long)
         if slot_ids is not None:
             slot_ids = slot_ids.to(layer.w13_weight.device, dtype=torch.long)
 
