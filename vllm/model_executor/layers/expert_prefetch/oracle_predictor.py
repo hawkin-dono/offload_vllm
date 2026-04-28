@@ -8,12 +8,13 @@ import os
 import time
 class OraclePredictor: 
     cache: dict = {}
-    def __init__(self, data_path: str, top_k: int, device: str = "cpu"): 
+    def __init__(self, data_path: str, top_k: int, device: str = "cpu", acc= 1.0): 
         if not os.path.exists(data_path):
             raise FileNotFoundError(f"Data file not found: {data_path}")
         self.data_path = data_path
         self.device = device
         self.top_k = top_k
+        self.acc = acc  # accuracy for simulating prediction errors
         self._preload_data()
         
     def _preload_data(self):
@@ -69,7 +70,9 @@ class OraclePredictor:
                 predictions.append(data)
         if not predictions:
             return torch.tensor([], device=self.device)
-        return torch.cat(predictions)
+        res = torch.cat(predictions)
+        res = res[:int(len(res)*self.acc)]  # Simulate prediction errors by keeping only a fraction of the predictions
+        return res
     
 def main():
     predictor = OraclePredictor(data_path="/home/hieuvt/vllm-hpclab/vllm_hidden_states.h5", top_k=8, device="cpu")

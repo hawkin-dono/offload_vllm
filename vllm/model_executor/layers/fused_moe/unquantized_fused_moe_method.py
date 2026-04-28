@@ -426,16 +426,28 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             # 2. Transfer the topk_ids from GPU to CPU to compare with cached_expert_ids: done
             unique_selected_ids = torch.unique(topk_ids.reshape(-1)).to(cached_expert_ids.device) 
 
+            # fix bug: can not replace cached_expert_ids with missing cache values
+            if cached_expert_ids.numel() < unique_selected_ids.numel():
+                cache_capacity = active_cache.num_experts 
+                pad_size = cache_capacity - cached_expert_ids.numel()
+                pad_tensor = torch.full((pad_size,), -1, dtype=cached_expert_ids.dtype, device=cached_expert_ids.device)
+                cached_expert_ids = torch.cat([cached_expert_ids, pad_tensor], dim=0)
+
             # 3. Do the checking on GPU
             expert_mask = torch.isin(unique_selected_ids, cached_expert_ids, assume_unique=True) # check if unique_selected_ids is subset of cached_expert_ids
             is_subset = expert_mask.all().item()
 
             if not is_subset:
                 missing_values = unique_selected_ids[~expert_mask]
-                cached_expert_ids = unique_selected_ids
-                # 4. if there is missing ids in predicted ids, fetch to GPU on demand
-                # NOTE(ducct): fetch on-demand missing experts into the cache. 
-                active_cache.fetch_on_demand(layer, cached_expert_ids.to("cpu"))  
+                
+                evict_mask = ~torch.isin(cached_expert_ids, unique_selected_ids, assume_unique=True)
+                evict_slots = torch.where(evict_mask)[0]
+                
+                replace_slots = evict_slots[:missing_values.numel()]
+                cached_expert_ids[replace_slots] = missing_values
+                
+                active_cache.fetch_on_demand(layer, missing_values.to("cpu"), replace_slots)
+                
                 if ENABLE_ACCURACY_TRACKING:
                     with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
                         f.write(f"[Cache Miss] missing expert ids: {missing_values.cpu().tolist()} \n")
