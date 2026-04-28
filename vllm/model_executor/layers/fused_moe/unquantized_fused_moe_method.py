@@ -451,7 +451,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 replace_slots = evict_slots[:missing_values.numel()]
                 cached_expert_ids[replace_slots] = missing_values
                 
-                active_cache.fetch_on_demand(layer, missing_values.to("cpu"), replace_slots)
+                # Fetch missing experts with current layer's ID from Pinned RAM fallback pool if enabled
+                layer_id = getattr(layer, "layer_idx", None)
+                active_cache.fetch_on_demand(layer=layer, expert_ids=missing_values.to("cpu"), slot_ids=replace_slots, layer_id=layer_id)
                 
                 if ENABLE_ACCURACY_TRACKING:
                     with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:

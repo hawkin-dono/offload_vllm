@@ -364,6 +364,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             is_sequence_parallel=self.is_sequence_parallel,
             routing_method_type=RoutingMethodType.Renormalize,
         )
+        self.experts.layer_idx = layer_idx
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -675,11 +676,15 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 moe.cached_expert_ids_pong = predicted_ids
             else:
                 moe.cached_expert_ids_ping = predicted_ids
+                
+            # Submit to copy queue for CPU Pinned Buffer (predicting for next layer)
+            moe.expert_cache.add_to_copy_queue(target_layer=moe, layer_id=self.layer_id + 1, expert_ids=predicted_ids.tolist())
+
             # 3) H2D prefetch on prefetch stream
             def do_prefetch():
                 # with torch.profiler.record_function("expert_prefetch.fetch_on_demand"):
                     inactive_bf = moe.expert_cache.get_inactive_buffer()
-                    inactive_bf.fetch_on_demand(moe, predicted_ids)
+                    inactive_bf.fetch_on_demand(layer=moe, expert_ids=predicted_ids, layer_id=self.layer_id + 1)
 
             with torch.cuda.stream(prefetch_stream):
                 with torch.profiler.record_function("ducct::prefetch"):
@@ -727,7 +732,8 @@ class Qwen3MoeModel(nn.Module):
 
         # NOTE(ducct): init expert cache
         self.expert_cache = ExpertCache(
-            num_experts=self.config.num_experts
+            num_experts=self.config.num_experts,
+            predict_distance=1
         )
 
         owner_fused_moe = next(

@@ -1,9 +1,35 @@
 import torch
 import torch.nn as nn
 from collections.abc import Callable
+import threading
+import queue
 
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.layers.fused_moe import FusedMoE
+
+
+class PinnedBuffer:
+    def __init__(self, num_experts, cached_parameter_names, sample_layer):
+        self.params = {}
+        self.ready_event = threading.Event()
+        self.ready_event.set()
+        for param_name in cached_parameter_names:
+            source_param = getattr(sample_layer, param_name)
+            self.params[param_name] = torch.empty(
+                (num_experts, *source_param.shape[1:]),
+                dtype=source_param.dtype,
+                device="cpu",
+                pin_memory=True
+            )
+
+class PinnedBufferPool:
+    def __init__(self, pool_size, num_experts, cached_parameter_names, sample_layer):
+        self.pool_size = pool_size
+        self.buffers = [PinnedBuffer(num_experts, cached_parameter_names, sample_layer) 
+                        for _ in range(pool_size)]
+        
+    def get_buffer(self, layer_id):
+        return self.buffers[layer_id % self.pool_size]
 
 
 class ExpertBuffer(nn.Module):
@@ -43,73 +69,6 @@ class ExpertBuffer(nn.Module):
         layer: FusedMoE,
         cached_parameter_names: tuple[str, ...],
     ):
-        # OLD(ducct): hard-coded MXFP4 cache layout.
-        # hidden_size = config.hidden_size
-        # intermediate_size = config.intermediate_size
-        # tp_size = get_tensor_model_parallel_world_size()
-        # assert intermediate_size % tp_size == 0
-        # intermediate_size_per_partition = intermediate_size // tp_size
-        # intermediate_size_per_partition_after_pad = intermediate_size_per_partition
-        # intermediate_size_per_partition_after_pad = round_up(
-        #     intermediate_size_per_partition, 128
-        # )
-        # if current_platform.is_xpu():
-        #     hidden_size = round_up(hidden_size, 128)
-        # else:
-        #     hidden_size = round_up(hidden_size, 256)
-        #
-        # self.w13_weight: torch.Tensor = torch.nn.Parameter(
-        #     torch.zeros(
-        #         self.num_experts,
-        #         2 * intermediate_size_per_partition_after_pad,
-        #         hidden_size // 2,
-        #         dtype=weight_dtype,
-        #     ),
-        #     requires_grad=False,
-        # )
-        # self.w13_weight_scale: torch.Tensor = torch.nn.Parameter(
-        #     torch.zeros(
-        #         self.num_experts,
-        #         2 * intermediate_size_per_partition_after_pad,
-        #         hidden_size // mxfp4_block,
-        #         dtype=scale_dtype,
-        #     ),
-        #     requires_grad=False,
-        # )
-        # self.w13_bias: torch.Tensor = torch.nn.Parameter(
-        #     torch.zeros(
-        #         self.num_experts,
-        #         2 * intermediate_size_per_partition_after_pad,
-        #         dtype=torch.bfloat16,
-        #     ),
-        #     requires_grad=False,
-        # )
-        # self.w2_weight: torch.Tensor = torch.nn.Parameter(
-        #     torch.zeros(
-        #         self.num_experts,
-        #         hidden_size,
-        #         intermediate_size_per_partition_after_pad // 2,
-        #         dtype=weight_dtype,
-        #     ),
-        #     requires_grad=False,
-        # )
-        # self.w2_weight_scale: torch.Tensor = torch.nn.Parameter(
-        #     torch.zeros(
-        #         self.num_experts,
-        #         hidden_size,
-        #         intermediate_size_per_partition_after_pad // mxfp4_block,
-        #         dtype=scale_dtype,
-        #     ),
-        #     requires_grad=False,
-        # )
-        # self.w2_bias: torch.Tensor = torch.nn.Parameter(
-        #     torch.zeros(
-        #         self.num_experts,
-        #         hidden_size,
-        #         dtype=torch.bfloat16,
-        #     ),
-        #     requires_grad=False,
-        # )
 
         for param_name in cached_parameter_names:
             source_param = getattr(layer, param_name)
@@ -130,7 +89,7 @@ class ExpertBuffer(nn.Module):
         src_u8 = src.view(torch.uint8)[expert_ids]
         dst_u8.copy_(src_u8)
 
-    def fetch_on_demand(self, layer, expert_ids, slot_ids: torch.Tensor | None = None):
+    def fetch_on_demand(self, layer, expert_ids, slot_ids: torch.Tensor | None = None, layer_id: int | None = None):
         expert_ids = expert_ids.reshape(-1)
         if expert_ids.numel() == 0:
             return
@@ -163,57 +122,36 @@ class ExpertBuffer(nn.Module):
                 device=layer.w13_weight.device,
                 dtype=torch.long,
             )
-        # NOTE(ducct): This code yields correct result
-        # self.w13_weight[slot_ids] = layer.w13_weight[local_ids].to("cuda")
-        # self.w13_bias[slot_ids] = layer.w13_bias[local_ids].to("cuda")
-        # self.w2_weight[slot_ids] = layer.w2_weight[local_ids].to("cuda")
-        # self.w2_bias[slot_ids] = layer.w2_bias[local_ids].to("cuda")
-
-        # # float8 scales: index via uint8 view
-        # # Use explicit slot_ids so cache rows align with cached_expert_ids.
-        # dst_u8 = self.w13_weight_scale.view(torch.uint8)
-        # src_u8 = layer.w13_weight_scale.view(torch.uint8)[local_ids]
-        # dst_u8[slot_ids] = src_u8.to("cuda")
-
-        # dst_u8 = self.w2_weight_scale.view(torch.uint8)
-        # src_u8 = layer.w2_weight_scale.view(torch.uint8)[local_ids]
-        # dst_u8[slot_ids] = src_u8.to("cuda")
-
-        # logger.info(f"layer.w13_weight: {layer.w13_weight.shape}")
-        # logger.info(f"layer.w13_weight_scale: {layer.w13_weight_scale.shape}")
-        # logger.info(f"layer.w13_bias: {layer.w13_bias.shape}")
-        # logger.info(f"layer.w2_weight: {layer.w2_weight.shape}")
-        # logger.info(f"layer.w2_weight_scale: {layer.w2_weight_scale.shape}")
-        # logger.info(f"layer.w2_bias: {layer.w2_bias.shape}")
-
-        # OLD(ducct): hard-coded MXFP4 cache copy path.
-        # for i, expert_id in enumerate(local_ids.tolist()):
-        #     self.w13_weight[i].copy_(layer.w13_weight[expert_id].pin_memory(), non_blocking=True)
-        #     self.w13_weight_scale[i].copy_(layer.w13_weight_scale[expert_id].pin_memory(), non_blocking=True)
-        #     self.w13_bias[i].copy_(layer.w13_bias[expert_id].pin_memory(), non_blocking=True)
-        #     self.w2_weight[i].copy_(layer.w2_weight[expert_id].pin_memory(), non_blocking=True)
-        #     self.w2_weight_scale[i].copy_(layer.w2_weight_scale[expert_id].pin_memory(), non_blocking=True)
-        #     self.w2_bias[i].copy_(layer.w2_bias[expert_id].pin_memory(), non_blocking=True)
-
+    
         cached_parameter_names = getattr(
             layer.expert_cache,
             "cached_parameter_names",
             (),
         )
+        
+        pinned_buffer = None
+        if layer_id is not None and hasattr(layer.expert_cache, "pinned_pool") and getattr(layer.expert_cache, "pinned_pool") is not None:
+            pinned_buffer = layer.expert_cache.pinned_pool.get_buffer(layer_id)
+            pinned_buffer.ready_event.wait()
+            
         for slot_id, expert_id in zip(slot_ids.tolist(), local_ids.tolist()):
             for param_name in cached_parameter_names:
                 cache_param = getattr(self, param_name)
-                layer_param = getattr(layer, param_name)
-                # print(f"cache_param: {cache_param.device}")
-                # print(f"layer_param: {layer_param.device}")
-                cache_param[slot_id].copy_(
-                    layer_param[expert_id].pin_memory(),
-                    non_blocking=True,
-                )
+                
+                if pinned_buffer is not None:
+                    cpu_pinned_param = pinned_buffer.params[param_name]
+                    cache_param[slot_id].copy_(cpu_pinned_param[slot_id], non_blocking=True)
+                else:
+                    # Fallback just in case
+                    layer_param = getattr(layer, param_name)
+                    cache_param[slot_id].copy_(
+                        layer_param[expert_id].pin_memory(),
+                        non_blocking=True,
+                    )
 
 
 class ExpertCache(nn.Module):
-    def __init__(self, num_experts):
+    def __init__(self, num_experts, predict_distance: int = 1):
         super().__init__()
         self.ping_buffer = ExpertBuffer(num_experts=num_experts, name="ping")
         self.pong_buffer = ExpertBuffer(num_experts=num_experts, name="pong")
@@ -221,6 +159,43 @@ class ExpertCache(nn.Module):
         # Bound at model init so we can reuse FusedMoE's loader logic.
         self.owner_fused_moe: FusedMoE | None = None
         self.cached_parameter_names: tuple[str, ...] = ()
+        
+        self.predict_distance = predict_distance
+        self.pinned_pool = None
+        self.copy_queue = queue.Queue()
+        self.copy_thread = threading.Thread(target=self._background_copy_loop, daemon=True)
+        self.copy_thread.start()
+
+    def _background_copy_loop(self):
+        while True:
+            task = self.copy_queue.get()
+            if task is None:
+                break
+                
+            target_layer, layer_id, expert_ids, slot_ids = task
+            if self.pinned_pool is None:
+                self.copy_queue.task_done()
+                continue
+                
+            pinned_buffer = self.pinned_pool.get_buffer(layer_id)
+            pinned_buffer.ready_event.clear()
+            
+            for slot_id, expert_id in zip(slot_ids, expert_ids):
+                for param_name in self.cached_parameter_names:
+                    layer_param = getattr(target_layer, param_name)
+                    pinned_param = pinned_buffer.params[param_name]
+                    pinned_param[slot_id].copy_(layer_param[expert_id])
+                    
+            pinned_buffer.ready_event.set()
+            self.copy_queue.task_done()
+
+    def add_to_copy_queue(self, target_layer, layer_id, expert_ids, slot_ids=None):
+        if slot_ids is None:
+            slot_ids = torch.arange(len(expert_ids), dtype=torch.long).tolist()
+        if isinstance(expert_ids, torch.Tensor):
+            expert_ids = expert_ids.tolist()
+            
+        self.copy_queue.put((target_layer, layer_id, expert_ids, slot_ids))
 
     # NOTE(ducct): custom weight loader for expert cache
     def cached_weight_loader(
@@ -308,6 +283,15 @@ class ExpertCache(nn.Module):
                 "Expert cache could not determine cached parameter layout for "
                 f"{owner_fused_moe.quant_method.__class__.__name__}."
             )
+            
+        if getattr(self, "pinned_pool", None) is None:
+            self.pinned_pool = PinnedBufferPool(
+                pool_size=self.predict_distance + 1,
+                num_experts=self.ping_buffer.num_experts,
+                cached_parameter_names=self.cached_parameter_names,
+                sample_layer=owner_fused_moe
+            )
+
         # Avoid reallocating shared buffers if they already exist.
         if (
             self.ping_buffer is not None
