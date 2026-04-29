@@ -9,6 +9,7 @@ def send_single_request():
     
     # Prompt đơn giản để test
     prompt = "Solve the equation: 2x + 3 = 7. What is x?"
+    # " To solve the equation 2x + 3 = 7, I need to isolate x. \n\nFirst, subtract 3 from both sides of the equation:\n2x + 3 - 3 = 7 - 3\n2x = 4\n\nNext, divide both sides by 2:\n2"
     
     payload = {
         "model": model_name,

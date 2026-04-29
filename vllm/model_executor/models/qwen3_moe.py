@@ -610,7 +610,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
         # NOTE(ducct): add expert predictor
         self.top_k = self.mlp.experts.top_k
-        self.expert_predictor = OraclePredictor(data_path="/home/hieuvt/vllm-hpclab/vllm_hidden_states_1seq.h5", top_k=self.top_k, device="cpu")
+        self.expert_predictor = OraclePredictor(data_path="/home/hieuvt/vllm-hpclab/oracle_cache.pkl", top_k=self.top_k, device="cpu")
 
     def forward(
         self,
@@ -685,10 +685,13 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 with torch.profiler.record_function("ducct::prefetch"):
                     moe.expert_cache.prefetch(predicted_ids, prefetch_fn=do_prefetch, stream=prefetch_stream)
 
-
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states, running_context[0], running_context[1])
+        
+        if not next_layer: # reset all prefetch buffer
+            self.mlp.experts.expert_cache.cached_expert_ids_ping = torch.empty(0, dtype=torch.int32) 
+            self.mlp.experts.expert_cache.cached_expert_ids_pong = torch.empty(0, dtype=torch.int32)
         return hidden_states, residual
 
 

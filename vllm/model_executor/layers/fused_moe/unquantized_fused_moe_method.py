@@ -427,21 +427,21 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             unique_selected_ids = torch.unique(topk_ids.reshape(-1)).to(cached_expert_ids.device) 
 
             # fix bug: can not replace cached_expert_ids with missing cache values
-            if cached_expert_ids.numel() < unique_selected_ids.numel():
-                cache_capacity = active_cache.num_experts 
-                pad_size = cache_capacity - cached_expert_ids.numel()
-                pad_tensor = torch.full((pad_size,), -1, dtype=cached_expert_ids.dtype, device=cached_expert_ids.device)
-                cached_expert_ids = torch.cat([cached_expert_ids, pad_tensor], dim=0)
+            cache_capacity = active_cache.num_experts 
+            pad_size = cache_capacity - cached_expert_ids.numel()
+            pad_tensor = torch.full((pad_size,), -1, dtype=cached_expert_ids.dtype, device=cached_expert_ids.device)
+            cached_expert_ids = torch.cat([cached_expert_ids, pad_tensor], dim=0)
 
             # 3. Do the checking on GPU
             expert_mask = torch.isin(unique_selected_ids, cached_expert_ids, assume_unique=True) # check if unique_selected_ids is subset of cached_expert_ids
             is_subset = expert_mask.all().item()
 
             if not is_subset:
-                missing_values = unique_selected_ids[~expert_mask]
+                missing_values = unique_selected_ids[~expert_mask].to(cached_expert_ids.dtype)
                 
-                evict_mask = ~torch.isin(cached_expert_ids, unique_selected_ids, assume_unique=True)
+                evict_mask = ~torch.isin(cached_expert_ids, unique_selected_ids)
                 evict_slots = torch.where(evict_mask)[0]
+                cached_expert_ids[evict_slots] = -1  # mark evicted slots with -1
                 
                 replace_slots = evict_slots[:missing_values.numel()]
                 cached_expert_ids[replace_slots] = missing_values
@@ -451,103 +451,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 if ENABLE_ACCURACY_TRACKING:
                     with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
                         f.write(f"[Cache Miss] missing expert ids: {missing_values.cpu().tolist()} \n")
-
-            # OLD: map expert IDs -> cache slot indices from cached_expert_ids.
-            # num_experts = getattr(layer, "num_experts", None) or layer.global_num_experts
-            # cached_expert_ids_dev = cached_expert_ids.to(device=topk_ids.device, dtype=torch.long)
-            # lookup = torch.full(
-            #     (num_experts,),
-            #     -1,
-            #     device=topk_ids.device,
-            #     dtype=torch.int32,
-            # )
-            # lookup[cached_expert_ids_dev] = torch.arange(
-            #     cached_expert_ids_dev.numel(),
-            #     device=topk_ids.device,
-            #     dtype=torch.int32,
-            # )
-            # cached_topk_ids = lookup[topk_ids]
-            # if (cached_topk_ids < 0).any():
-            #     raise RuntimeError("topk_ids contains experts not present in cache.")
-            
-            # DEBUG(ducct):
-            # for slot_id, selected_id in zip(torch.tensor(list(range(cached_expert_ids.numel()))), cached_expert_ids):
-            #     assert torch.allclose(active_cache.w13_weight[slot_id].to("cpu"), layer.w13_weight[selected_id], atol=1e-5, rtol=1e-5)
-            #     assert torch.allclose(active_cache.w2_weight[slot_id].to("cpu"), layer.w2_weight[selected_id], atol=1e-5, rtol=1e-5)
-            #     assert torch.allclose(active_cache.w13_weight_scale[slot_id].to("cpu"), layer.w13_weight_scale[selected_id], atol=1e-5, rtol=1e-5)
-            #     assert torch.allclose(active_cache.w2_weight_scale[slot_id].to("cpu"), layer.w2_weight_scale[selected_id], atol=1e-5, rtol=1e-5)
-            #     assert torch.allclose(active_cache.w13_bias[slot_id].to("cpu"), layer.w13_bias[selected_id], atol=1e-5, rtol=1e-5)
-            #     assert torch.allclose(active_cache.w2_bias[slot_id].to("cpu"), layer.w2_bias[selected_id], atol=1e-5, rtol=1e-5)
-
-            # DEBUG(ducct): for each cache slot, compare against all layer experts and
-            # return the matched layer expert id.
-            # layer_w13_cpu = (
-            #     layer.w13_bias
-            #     if layer.w13_bias.device.type == "cpu"
-            #     else layer.w13_bias.to("cpu")
-            # )
-            # layer_w2_cpu = (
-            #     layer.w2_bias
-            #     if layer.w2_bias.device.type == "cpu"
-            #     else layer.w2_bias.to("cpu")
-            # )
-            # matched_layer_ids_cpu = torch.full(
-            #     (cached_expert_ids.numel(),), -1, dtype=torch.long
-            # )
-            # for slot_id in range(cached_expert_ids.numel()):
-            #     cache_w13_cpu = active_cache.w13_bias[slot_id].to("cpu")
-            #     cache_w2_cpu = active_cache.w2_bias[slot_id].to("cpu")
-            #     for layer_id in range(layer_w13_cpu.shape[0]):
-            #         w13_match = (
-            #             torch.allclose(
-            #                 cache_w13_cpu,
-            #                 layer_w13_cpu[layer_id],
-            #                 atol=1e-5,
-            #                 rtol=1e-5,
-            #             )
-            #             if cache_w13_cpu.is_floating_point()
-            #             else torch.equal(cache_w13_cpu, layer_w13_cpu[layer_id])
-            #         )
-            #         if not w13_match:
-            #             continue
-            #         w2_match = (
-            #             torch.allclose(
-            #                 cache_w2_cpu,
-            #                 layer_w2_cpu[layer_id],
-            #                 atol=1e-5,
-            #                 rtol=1e-5,
-            #             )
-            #             if cache_w2_cpu.is_floating_point()
-            #             else torch.equal(cache_w2_cpu, layer_w2_cpu[layer_id])
-            #         )
-            #         if w2_match:
-            #             matched_layer_ids_cpu[slot_id] = layer_id
-            #             break
-
-            # if (matched_layer_ids_cpu < 0).any():
-            #     unmatched_slots = torch.where(matched_layer_ids_cpu < 0)[0].tolist()
-            #     raise RuntimeError(
-            #         "Could not match active_cache slots to layer expert ids. "
-            #         f"Unmatched slots: {unmatched_slots}"
-            #     )
-
-            # matched_layer_ids = matched_layer_ids_cpu.to(
-            #     device=topk_ids.device, dtype=torch.long
-            # )
-            # print(f"matched_layer_ids_by_slot: {matched_layer_ids}")
-            # # Reverse view: print matched slot id keyed by layer weight id.
-            # matched_slot_by_layer_cpu = torch.full(
-            #     (layer_w13_cpu.shape[0],), -1, dtype=torch.long
-            # )
-            # matched_slot_by_layer_cpu[matched_layer_ids_cpu] = torch.arange(
-            #     matched_layer_ids_cpu.numel(), dtype=torch.long
-            # )
-            # for layer_weight_id in torch.where(matched_slot_by_layer_cpu >= 0)[0].tolist():
-            #     print(
-            #         "matched_id_by_layer_weight_id: "
-            #         f"layer_weight_id={layer_weight_id}, "
-            #         f"matched_slot_id={matched_slot_by_layer_cpu[layer_weight_id].item()}"
-            #     )
 
             # Use cached ids (not debug-only matched ids) to build topk -> cache-slot lookup.
             num_experts = getattr(layer, "num_experts", None) or layer.global_num_experts
@@ -560,19 +463,23 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 device=topk_ids.device,
                 dtype=torch.int32,
             )
-            # OLD:
-            # lookup[cached_expert_ids] = torch.arange(
-            #     cached_expert_ids.numel(),
-            #     device=topk_ids.device,
-            #     dtype=torch.int32,
-            # )
-            lookup[lookup_expert_ids] = torch.arange(
+            
+            # Filter out -1 to avoid overwriting lookup[-1] (which corresponds to expert ID: num_experts - 1)
+            valid_mask = lookup_expert_ids >= 0
+            valid_expert_ids = lookup_expert_ids[valid_mask]
+            valid_slots = torch.arange(
                 lookup_expert_ids.numel(),
                 device=topk_ids.device,
                 dtype=torch.int32,
-            )
+            )[valid_mask]
+            
+            lookup[valid_expert_ids] = valid_slots
             cached_topk_ids = lookup[topk_ids]
             if (cached_topk_ids < 0).any():
+                with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
+                    f.write(f"[Error] topk_ids: {topk_ids.cpu().tolist()} \n")
+                    f.write(f"[Error] cached_expert_ids: {cached_expert_ids.cpu().tolist()} \n")
+                    f.write(f"[Error] unique_selected_ids: {unique_selected_ids.cpu().tolist()} \n")
                 raise RuntimeError(
                     "topk_ids contains experts not present in matched cache slots."
                 )
