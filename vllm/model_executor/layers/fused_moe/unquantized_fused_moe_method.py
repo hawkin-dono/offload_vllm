@@ -411,6 +411,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             # TODO(ducct): checking if selected experts (topk_ids) exist in the current layer's expert cache. The mapper is on CPU -> need to:
             # 1. Get the unique set of topk_ids -> unique_expert_ids: done
             active_cache = layer.expert_cache.get_active_buffer()
+            
+            if not active_cache.is_avail():
+                # If active cache is not available, it means the prefetch for this layer has not been completed yet. We should wait for the prefetch to complete before proceeding.
+                if torch.cuda.is_available() and active_cache.prefetch_event is not None:
+                    torch.cuda.current_stream().wait_event(active_cache.prefetch_event)
+                active_cache.avail = True  
+                
             inactive_cache = layer.expert_cache.get_inactive_buffer()
             if layer.expert_cache.active_buffer == "ping":
                 # NOTE(ducct): temporary fix
@@ -502,12 +509,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 expert_map=expert_map,
             )
 
+            # Notel(hieuvt): event should be wait at beggining of next layer moe
             # NOTE(ducct): Check if inactive buffer is available (done prefetching).
             # If not available yet, wait on the prefetch event before flipping.
-            if not inactive_cache.is_avail():
-                if torch.cuda.is_available() and inactive_cache.prefetch_event is not None:
-                    torch.cuda.current_stream().wait_event(inactive_cache.prefetch_event)
-                inactive_cache.avail = True
+            # if not inactive_cache.is_avail():
+            #     if torch.cuda.is_available() and inactive_cache.prefetch_event is not None:
+            #         torch.cuda.current_stream().wait_event(inactive_cache.prefetch_event)
+            #     inactive_cache.avail = True
             layer.expert_cache.flip_active_buffer()
 
 
