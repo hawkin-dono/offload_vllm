@@ -6,9 +6,11 @@ import numpy as np
 import h5py 
 import os 
 import time
+import pickle
+
 class OraclePredictor: 
     cache: dict = {}
-    def __init__(self, data_path: str, top_k: int, device: str = "cpu", acc= 1.0): 
+    def __init__(self, data_path: str, top_k: int, device: str = "cpu", acc= 0.8): 
         if not os.path.exists(data_path):
             raise FileNotFoundError(f"Data file not found: {data_path}")
         self.data_path = data_path
@@ -20,33 +22,14 @@ class OraclePredictor:
     def _preload_data(self):
         if OraclePredictor.cache: return
         start_time = time.time()
-        print(f"hieuvt:Loading and precomputing Oracle Predictor data from {self.data_path} to {self.device}...")
-        with h5py.File(self.data_path, "r") as f:
-            for seq_id in f.keys():
-                # if int(seq_id[-1]) >= 5: break
-                # seq_id dạng: 'seq_001'
-                for step_key in f[seq_id].keys():
-                    if not step_key.startswith("step_"): continue
-                    step_idx = int(step_key.split("_")[1])
-                    
-                    for layer_key in f[seq_id][step_key].keys():
-                        if not layer_key.startswith("layer_"): continue
-                        try:
-                            layer_idx = int(layer_key.split("_")[1])
-                        except Exception as e:
-                            continue
-                        
-                        path = f"{seq_id}/{step_key}/{layer_key}/router_logits"
-                        if path in f:
-                            data = f[path][:]
-                            data_tensor = torch.tensor(data, device=self.device)
-                            topk_ids = torch.topk(data_tensor, k=self.top_k, dim=-1).indices
-                            OraclePredictor.cache[(seq_id, step_idx, layer_idx)] = topk_ids.view(-1)
-                        else:
-                            if layer_key != "layer_embed":
-                                print(f"hieuvt:Router logits not found for {seq_id}, {step_key}, {layer_key}")
+        print(f"hieuvt:Loading Oracle Predictor data from {self.data_path}...")
+        
+        # Load from PKL directly
+        with open(self.data_path, "rb") as f:
+            OraclePredictor.cache = pickle.load(f)
+            
         end_time = time.time()
-        print(f"hieuvt:Oracle Predictor loaded {len(OraclePredictor.cache)} entries successfully in {end_time - start_time} seconds!")
+        print(f"hieuvt:Oracle Predictor loaded {len(OraclePredictor.cache)} entries successfully in {end_time - start_time:.2f} seconds!")
         
     def predict_experts_batch(self, seq_ids: list, steps:list, layer_ids):
         predictions = []
@@ -67,15 +50,17 @@ class OraclePredictor:
                 
             data = OraclePredictor.cache.get((true_seq_id, step_val, layer_ids))
             if data is not None:
-                predictions.append(data)
+                # convert cached list array back to tensor on correct device
+                predictions.append(torch.tensor(data, device=self.device, dtype=torch.int32))
         if not predictions:
-            return torch.tensor([], device=self.device)
+            return torch.tensor([], device=self.device, dtype=torch.int32)
         res = torch.cat(predictions)
         res = res[:int(len(res)*self.acc)]  # Simulate prediction errors by keeping only a fraction of the predictions
         return res
     
 def main():
-    predictor = OraclePredictor(data_path="/home/hieuvt/vllm-hpclab/vllm_hidden_states.h5", top_k=8, device="cpu")
+    # Update main function to point to the new pickle file instead
+    predictor = OraclePredictor(data_path="/home/hieuvt/vllm-hpclab/oracle_cache.pkl", top_k=8, device="cpu")
     seq = ['cmpl-seq_004-0']
     step = [313]
     layer_id = 9
