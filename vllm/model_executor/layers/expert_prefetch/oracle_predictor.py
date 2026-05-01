@@ -10,13 +10,16 @@ import pickle
 
 class OraclePredictor: 
     cache: dict = {}
-    def __init__(self, data_path: str, top_k: int, device: str = "cpu", acc= 0.8): 
+    def __init__(self, data_path: str, top_k: int, device: str = "cpu", acc=None): 
         if not os.path.exists(data_path):
             raise FileNotFoundError(f"Data file not found: {data_path}")
         self.data_path = data_path
         self.device = device
         self.top_k = top_k
-        self.acc = acc  # accuracy for simulating prediction errors
+        if acc is None:
+            self.acc = float(os.environ.get("ORACLE_PREDICTOR_ACCURACY", "1.0"))
+        else:
+            self.acc = acc  # accuracy for simulating prediction errors
         self._preload_data()
         
     def _preload_data(self):
