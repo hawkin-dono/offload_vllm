@@ -7,7 +7,7 @@ from vllm.model_executor.layers.expert_prefetch.expert_cache import (
 )
 
 from vllm.model_executor.layers.expert_prefetch.expert_predictor import (
-    ExpertPredictorModel,
+    ExpertPredictionModel,
 )
 
 from vllm.model_executor.layers.expert_prefetch.oracle_predictor import OraclePredictor
@@ -31,7 +31,7 @@ def get_config() -> dict[str, Any] | None:
 __all__ = [
     "ExpertBuffer",
     "ExpertCache",
-    "ExpertPredictorModel",
+    "ExpertPredictionModel",
     "override_config",
     "get_config",
 ]

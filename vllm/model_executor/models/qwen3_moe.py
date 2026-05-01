@@ -81,7 +81,7 @@ import os
 from typing import Dict, List 
 from pathlib import Path
 
-from vllm.model_executor.layers.expert_prefetch import ExpertPredictorModel, ExpertCache, OraclePredictor
+from vllm.model_executor.layers.expert_prefetch import ExpertPredictionModel, ExpertCache, OraclePredictor
 from vllm.forward_context import get_forward_context
 
 # Hidden-state dump (for correctness checks)
@@ -610,7 +610,10 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
         # NOTE(ducct): add expert predictor
         self.top_k = self.mlp.experts.top_k
-        self.expert_predictor = OraclePredictor(data_path="/home/hieuvt/vllm-hpclab/oracle_cache.pkl", top_k=self.top_k, device="cpu")
+        # self.expert_predictor = OraclePredictor(data_path="/home/hieuvt/vllm-hpclab/oracle_cache.pkl", top_k=self.top_k, device="cpu")
+        self.expert_predictor = ExpertPredictionModel.load_from_checkpoint("vllm/model_executor/layers/expert_prefetch/checkpoints/epoch=06-val_acc=0.8151.ckpt")
+        self.expert_predictor = self.expert_predictor.to("cuda:0")
+        self.expert_predictor.eval()  
 
     def forward(
         self,
@@ -624,14 +627,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-        )
-        # TODO(ducct): Predict + prefetch expert weights for next layer here only if you want to prefectch after attn
-        # predictor runs on CPU -> transfer hidden_states back to CPU for computation
-        # The output of the expert predictor, predicted_topk_ids is used to form a CPU tensor of size (num_predicted_experts, inter_dim, hidden_dim)
-        # Then we copy this tensor to next layer's cache. How do we access next layer's cache here?
+        
+
         next_layer = getattr(self, "next_layer", None)
         running_context = get_running_context()
         if next_layer is not None and hidden_states.is_cuda:
@@ -640,20 +637,16 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 self._prefetch_stream = torch.cuda.Stream()
                 prefetch_stream = self._prefetch_stream
 
-            # # 1) D2H copy on prefetch stream
-            # # with torch.profiler.record_function("expert_prefetch.d2h_hidden_states"):
-            # with torch.cuda.stream(prefetch_stream):
-            #     hs_cpu = hidden_states.detach().to("cpu", non_blocking=True)
-            # prefetch_stream.synchronize() # ensure d2h done before CPU prediction
 
             # 2) NOTE(hieuvt): handle seq_id
             moe = next_layer.mlp.experts
             with torch.profiler.record_function("ducct::expert_predictor"):
-                
+                tmp_hidden_states = residual.detach()  # Detach to avoid unnecessary autograd tracking
+                layer_ids = torch.full((hidden_states.shape[0],), self.layer_id, dtype=torch.long, device=tmp_hidden_states.device)
                 predicted_ids = self.expert_predictor.predict_experts_batch(
-                    running_context[0], running_context[1], layer_ids= self.layer_id + 1)
-                predicted_ids = predicted_ids.reshape(-1)
-                predicted_ids = torch.unique(predicted_ids)
+                    tmp_hidden_states, layer_ids=layer_ids
+                )
+                
                 if ENABLE_ACCURACY_TRACKING:
                     accuracy_tracker.log_predicted(running_context[0], running_context[1], self.layer_id + 1, predicted_ids)
                 # with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
@@ -685,6 +678,10 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 with torch.profiler.record_function("ducct::prefetch"):
                     moe.expert_cache.prefetch(predicted_ids, prefetch_fn=do_prefetch, stream=prefetch_stream)
 
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+        )
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states, running_context[0], running_context[1])
