@@ -81,7 +81,7 @@ import os
 from typing import Dict, List 
 from pathlib import Path
 
-from vllm.model_executor.layers.expert_prefetch import ExpertPredictorModel, ExpertCache, OraclePredictor
+from vllm.model_executor.layers.expert_prefetch import ExpertPredictorModel, ExpertCache, OraclePredictor, FatePredictor
 from vllm.forward_context import get_forward_context
 
 # Hidden-state dump (for correctness checks)
@@ -610,7 +610,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
         # NOTE(ducct): add expert predictor
         self.top_k = self.mlp.experts.top_k
-        self.expert_predictor = OraclePredictor(data_path="/home/hieuvt/vllm-hpclab/oracle_cache.pkl", top_k=self.top_k, device="cpu")
+        # self.expert_predictor = OraclePredictor(data_path="/home/hieuvt/vllm-hpclab/oracle_cache.pkl", top_k=self.top_k, device="cpu")
 
     def forward(
         self,
@@ -628,6 +628,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
         )
+        
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        
         # TODO(ducct): Predict + prefetch expert weights for next layer here only if you want to prefectch after attn
         # predictor runs on CPU -> transfer hidden_states back to CPU for computation
         # The output of the expert predictor, predicted_topk_ids is used to form a CPU tensor of size (num_predicted_experts, inter_dim, hidden_dim)
@@ -649,22 +652,18 @@ class Qwen3MoeDecoderLayer(nn.Module):
             # 2) NOTE(hieuvt): handle seq_id
             moe = next_layer.mlp.experts
             with torch.profiler.record_function("ducct::expert_predictor"):
-                
-                predicted_ids = self.expert_predictor.predict_experts_batch(
-                    running_context[0], running_context[1], layer_ids= self.layer_id + 1)
+                fate_predictor = getattr(self, "fate_predictor", None)
+                if fate_predictor is not None:
+                    predicted_ids = fate_predictor.predict_experts_batch(
+                        layer_id=self.layer_id + 1,
+                        hidden_states=hidden_states
+                    )
+                else:
+                    predicted_ids = torch.tensor([], device="cpu", dtype=torch.int32)
                 predicted_ids = predicted_ids.reshape(-1)
                 predicted_ids = torch.unique(predicted_ids)
                 if ENABLE_ACCURACY_TRACKING:
                     accuracy_tracker.log_predicted(running_context[0], running_context[1], self.layer_id + 1, predicted_ids)
-                # with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
-                #     # for req, step in zip(running_context[0], running_context[1]):
-                #         # f.write(f"[GPU Layer] Request: {req} đang ở token thứ: {step}\n")
-                #     f.write(f"[Predicted IDs] req: {running_context[0]}, step: {running_context[1]}, layer_id: {self.layer_id + 1}, predicted_ids: {predicted_ids.tolist()}\n")
-
-                # )  # CPU
-                # predicted_ids = torch.tensor([0, 1, 2, 3], device="cpu")
-            # NOTE(ducct):Normalize predicted ids to a unique 1D list (cache expects <= num_experts).
-            # with torch.profiler.record_function("expert_ids.check_and_normalize"):
             
             max_cache = moe.expert_cache.ping_buffer.w13_weight.shape[0]
             if predicted_ids.numel() > max_cache:
@@ -686,7 +685,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
                     moe.expert_cache.prefetch(predicted_ids, prefetch_fn=do_prefetch, stream=prefetch_stream)
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states, running_context[0], running_context[1])
         
         if not next_layer: # reset all prefetch buffer
@@ -721,12 +719,19 @@ class Qwen3MoeModel(nn.Module):
             prefix=f"{prefix}.layers",
         )
 
+        self.fate_predictor = FatePredictor(
+            num_layers=config.num_hidden_layers,
+            top_k=config.num_experts_per_tok,
+            device="cuda"  # Bạn có thể đổi thành "cuda" để chạy trên GPU
+        )
+
         # NOTE(ducct): Link neighboring layers without registering as submodules.
         for i, layer in enumerate(self.layers):
             if isinstance(layer, PPMissingLayer):
                 continue
             next_layer = self.layers[i + 1] if i + 1 < len(self.layers) else None
             layer.__dict__["next_layer"] = next_layer
+            layer.__dict__["fate_predictor"] = self.fate_predictor
 
         # NOTE(ducct): init expert cache
         self.expert_cache = ExpertCache(
@@ -998,6 +1003,9 @@ class Qwen3MoeModel(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+        # Load weights into the fate predictor since weights are loaded onto model now
+        self.fate_predictor.load_gate_weights(self.layers)
+
         # Mark expert cache parameters as initialized even if not from checkpoint.
         # These are created at runtime and populated by the cache prefetch logic.
         try:
