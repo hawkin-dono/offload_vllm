@@ -628,7 +628,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         
-
         next_layer = getattr(self, "next_layer", None)
         running_context = get_running_context()
         if next_layer is not None and hidden_states.is_cuda:
@@ -637,27 +636,16 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 self._prefetch_stream = torch.cuda.Stream()
                 prefetch_stream = self._prefetch_stream
 
-
             # 2) NOTE(hieuvt): handle seq_id
             moe = next_layer.mlp.experts
-            with torch.profiler.record_function("ducct::expert_predictor"):
-                tmp_hidden_states = residual.detach()  # Detach to avoid unnecessary autograd tracking
-                layer_ids = torch.full((hidden_states.shape[0],), self.layer_id, dtype=torch.long, device=tmp_hidden_states.device)
-                predicted_ids = self.expert_predictor.predict_experts_batch(
-                    tmp_hidden_states, layer_ids=layer_ids
-                )
                 
-                if ENABLE_ACCURACY_TRACKING:
-                    accuracy_tracker.log_predicted(running_context[0], running_context[1], self.layer_id + 1, predicted_ids)
-                # with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
-                #     # for req, step in zip(running_context[0], running_context[1]):
-                #         # f.write(f"[GPU Layer] Request: {req} đang ở token thứ: {step}\n")
-                #     f.write(f"[Predicted IDs] req: {running_context[0]}, step: {running_context[1]}, layer_id: {self.layer_id + 1}, predicted_ids: {predicted_ids.tolist()}\n")
-
-                # )  # CPU
-                # predicted_ids = torch.tensor([0, 1, 2, 3], device="cpu")
-            # NOTE(ducct):Normalize predicted ids to a unique 1D list (cache expects <= num_experts).
-            # with torch.profiler.record_function("expert_ids.check_and_normalize"):
+            tmp_hidden_states = residual.detach()  # Detach to avoid unnecessary autograd tracking
+            layer_ids = torch.full((hidden_states.shape[0],), self.layer_id, dtype=torch.long, device=tmp_hidden_states.device)
+            predicted_ids = self.expert_predictor.predict_experts_batch(
+                tmp_hidden_states, layer_ids=layer_ids
+            )
+            if ENABLE_ACCURACY_TRACKING:
+                accuracy_tracker.log_predicted(running_context[0], running_context[1], self.layer_id + 1, predicted_ids)
             
             max_cache = moe.expert_cache.ping_buffer.w13_weight.shape[0]
             if predicted_ids.numel() > max_cache:
@@ -668,15 +656,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 moe.cached_expert_ids_pong = predicted_ids
             else:
                 moe.cached_expert_ids_ping = predicted_ids
-            # 3) H2D prefetch on prefetch stream
-            def do_prefetch():
-                # with torch.profiler.record_function("expert_prefetch.fetch_on_demand"):
-                    inactive_bf = moe.expert_cache.get_inactive_buffer()
-                    inactive_bf.fetch_on_demand(moe, predicted_ids)
-
-            with torch.cuda.stream(prefetch_stream):
-                with torch.profiler.record_function("ducct::prefetch"):
-                    moe.expert_cache.prefetch(predicted_ids, prefetch_fn=do_prefetch, stream=prefetch_stream)
+                
+            inactive_buffer = moe.expert_cache.get_inactive_buffer()
+            moe.expert_cache.prefetch(moe, predicted_ids, prefetch_stream, inactive_buffer)
 
         hidden_states = self.self_attn(
             positions=positions,

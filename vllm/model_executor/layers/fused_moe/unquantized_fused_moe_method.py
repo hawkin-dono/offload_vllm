@@ -413,27 +413,21 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             active_cache = layer.expert_cache.get_active_buffer()
             
             if not active_cache.is_avail():
-                # If active cache is not available, it means the prefetch for this layer has not been completed yet. We should wait for the prefetch to complete before proceeding.
+                if hasattr(active_cache, "cpu_done_event"):
+                    active_cache.cpu_done_event.wait()
+                    
                 if torch.cuda.is_available() and active_cache.prefetch_event is not None:
                     torch.cuda.current_stream().wait_event(active_cache.prefetch_event)
                 active_cache.avail = True  
                 
             inactive_cache = layer.expert_cache.get_inactive_buffer()
             if layer.expert_cache.active_buffer == "ping":
-                # NOTE(ducct): temporary fix
-                # layer.cached_expert_ids_ping = torch.empty(0, dtype=torch.int32, device="cuda")
                 cached_expert_ids = layer.cached_expert_ids_ping
-                #layer.cached_expert_ids_ping = torch.empty(0, dtype=torch.int32, device="cuda")
 
             else:
-                # NOTE(ducct):temporary fix
-                # layer.cached_expert_ids_pong = torch.empty(0, dtype=torch.int32, device="cuda")
                 cached_expert_ids = layer.cached_expert_ids_pong
-                #layer.cached_expert_ids_pong = torch.empty(0, dtype=torch.int32, device="cuda")
-            # 2. Transfer the topk_ids from GPU to CPU to compare with cached_expert_ids: done
             unique_selected_ids = torch.unique(topk_ids.reshape(-1)).to(cached_expert_ids.device) 
 
-            # fix bug: can not replace cached_expert_ids with missing cache values
             cache_capacity = active_cache.num_experts 
             pad_size = cache_capacity - cached_expert_ids.numel()
             pad_tensor = torch.full((pad_size,), -1, dtype=cached_expert_ids.dtype, device=cached_expert_ids.device)
