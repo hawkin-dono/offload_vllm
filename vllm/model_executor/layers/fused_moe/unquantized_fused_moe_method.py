@@ -413,7 +413,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             active_cache = layer.expert_cache.get_active_buffer()
             
             if not active_cache.is_avail():
-                # If active cache is not available, it means the prefetch for this layer has not been completed yet. We should wait for the prefetch to complete before proceeding.
+                if hasattr(active_cache, "cpu_done_event"):
+                    active_cache.cpu_done_event.wait()
+                    
                 if torch.cuda.is_available() and active_cache.prefetch_event is not None:
                     torch.cuda.current_stream().wait_event(active_cache.prefetch_event)
                 active_cache.avail = True  

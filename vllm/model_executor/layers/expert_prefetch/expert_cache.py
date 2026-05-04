@@ -4,7 +4,8 @@ from collections.abc import Callable
 
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.layers.fused_moe import FusedMoE
-
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 class ExpertBuffer(nn.Module):
     w13_weight: torch.Tensor
@@ -28,6 +29,8 @@ class ExpertBuffer(nn.Module):
         )
         self.avail = True
         self.prefetch_event: torch.cuda.Event | None = None
+        self.cpu_done_event = threading.Event()
+        self.cpu_done_event.set() # Mặc định ban đầu là xong
 
     def record_expert_ids(self, expert_ids: torch.Tensor):
         self.cached_expert_ids = expert_ids
@@ -43,73 +46,7 @@ class ExpertBuffer(nn.Module):
         layer: FusedMoE,
         cached_parameter_names: tuple[str, ...],
     ):
-        # OLD(ducct): hard-coded MXFP4 cache layout.
-        # hidden_size = config.hidden_size
-        # intermediate_size = config.intermediate_size
-        # tp_size = get_tensor_model_parallel_world_size()
-        # assert intermediate_size % tp_size == 0
-        # intermediate_size_per_partition = intermediate_size // tp_size
-        # intermediate_size_per_partition_after_pad = intermediate_size_per_partition
-        # intermediate_size_per_partition_after_pad = round_up(
-        #     intermediate_size_per_partition, 128
-        # )
-        # if current_platform.is_xpu():
-        #     hidden_size = round_up(hidden_size, 128)
-        # else:
-        #     hidden_size = round_up(hidden_size, 256)
-        #
-        # self.w13_weight: torch.Tensor = torch.nn.Parameter(
-        #     torch.zeros(
-        #         self.num_experts,
-        #         2 * intermediate_size_per_partition_after_pad,
-        #         hidden_size // 2,
-        #         dtype=weight_dtype,
-        #     ),
-        #     requires_grad=False,
-        # )
-        # self.w13_weight_scale: torch.Tensor = torch.nn.Parameter(
-        #     torch.zeros(
-        #         self.num_experts,
-        #         2 * intermediate_size_per_partition_after_pad,
-        #         hidden_size // mxfp4_block,
-        #         dtype=scale_dtype,
-        #     ),
-        #     requires_grad=False,
-        # )
-        # self.w13_bias: torch.Tensor = torch.nn.Parameter(
-        #     torch.zeros(
-        #         self.num_experts,
-        #         2 * intermediate_size_per_partition_after_pad,
-        #         dtype=torch.bfloat16,
-        #     ),
-        #     requires_grad=False,
-        # )
-        # self.w2_weight: torch.Tensor = torch.nn.Parameter(
-        #     torch.zeros(
-        #         self.num_experts,
-        #         hidden_size,
-        #         intermediate_size_per_partition_after_pad // 2,
-        #         dtype=weight_dtype,
-        #     ),
-        #     requires_grad=False,
-        # )
-        # self.w2_weight_scale: torch.Tensor = torch.nn.Parameter(
-        #     torch.zeros(
-        #         self.num_experts,
-        #         hidden_size,
-        #         intermediate_size_per_partition_after_pad // mxfp4_block,
-        #         dtype=scale_dtype,
-        #     ),
-        #     requires_grad=False,
-        # )
-        # self.w2_bias: torch.Tensor = torch.nn.Parameter(
-        #     torch.zeros(
-        #         self.num_experts,
-        #         hidden_size,
-        #         dtype=torch.bfloat16,
-        #     ),
-        #     requires_grad=False,
-        # )
+        
 
         for param_name in cached_parameter_names:
             source_param = getattr(layer, param_name)
@@ -163,37 +100,6 @@ class ExpertBuffer(nn.Module):
                 device=layer.w13_weight.device,
                 dtype=torch.long,
             )
-        # NOTE(ducct): This code yields correct result
-        # self.w13_weight[slot_ids] = layer.w13_weight[local_ids].to("cuda")
-        # self.w13_bias[slot_ids] = layer.w13_bias[local_ids].to("cuda")
-        # self.w2_weight[slot_ids] = layer.w2_weight[local_ids].to("cuda")
-        # self.w2_bias[slot_ids] = layer.w2_bias[local_ids].to("cuda")
-
-        # # float8 scales: index via uint8 view
-        # # Use explicit slot_ids so cache rows align with cached_expert_ids.
-        # dst_u8 = self.w13_weight_scale.view(torch.uint8)
-        # src_u8 = layer.w13_weight_scale.view(torch.uint8)[local_ids]
-        # dst_u8[slot_ids] = src_u8.to("cuda")
-
-        # dst_u8 = self.w2_weight_scale.view(torch.uint8)
-        # src_u8 = layer.w2_weight_scale.view(torch.uint8)[local_ids]
-        # dst_u8[slot_ids] = src_u8.to("cuda")
-
-        # logger.info(f"layer.w13_weight: {layer.w13_weight.shape}")
-        # logger.info(f"layer.w13_weight_scale: {layer.w13_weight_scale.shape}")
-        # logger.info(f"layer.w13_bias: {layer.w13_bias.shape}")
-        # logger.info(f"layer.w2_weight: {layer.w2_weight.shape}")
-        # logger.info(f"layer.w2_weight_scale: {layer.w2_weight_scale.shape}")
-        # logger.info(f"layer.w2_bias: {layer.w2_bias.shape}")
-
-        # OLD(ducct): hard-coded MXFP4 cache copy path.
-        # for i, expert_id in enumerate(local_ids.tolist()):
-        #     self.w13_weight[i].copy_(layer.w13_weight[expert_id].pin_memory(), non_blocking=True)
-        #     self.w13_weight_scale[i].copy_(layer.w13_weight_scale[expert_id].pin_memory(), non_blocking=True)
-        #     self.w13_bias[i].copy_(layer.w13_bias[expert_id].pin_memory(), non_blocking=True)
-        #     self.w2_weight[i].copy_(layer.w2_weight[expert_id].pin_memory(), non_blocking=True)
-        #     self.w2_weight_scale[i].copy_(layer.w2_weight_scale[expert_id].pin_memory(), non_blocking=True)
-        #     self.w2_bias[i].copy_(layer.w2_bias[expert_id].pin_memory(), non_blocking=True)
 
         cached_parameter_names = getattr(
             layer.expert_cache,
@@ -210,6 +116,60 @@ class ExpertBuffer(nn.Module):
                     layer_param[expert_id].pin_memory(),
                     non_blocking=True,
                 )
+                
+    def chunking_prefetch(self, layer, expert_ids, slot_ids: torch.Tensor | None = None, chunk_size: int = 4):
+        expert_ids = expert_ids.reshape(-1)
+        if expert_ids.numel() == 0:
+            return
+
+        if getattr(layer, "expert_map", None) is not None:  #not matter, since run on 1 device
+            map_device = layer.expert_map.device
+            local_ids = layer.expert_map[
+                expert_ids.to(map_device, dtype=torch.long)
+            ]
+            keep = local_ids >= 0
+            if not torch.any(keep):
+                return
+            local_ids = local_ids[keep]
+        else:
+            local_ids = expert_ids
+
+        if slot_ids is not None:
+            slot_ids = slot_ids.to(layer.w13_weight.device, dtype=torch.long)
+
+        num_expert_ids = local_ids.numel()
+
+        if slot_ids is None:
+            slot_ids = torch.arange(
+                num_expert_ids,
+                device=layer.w13_weight.device,
+                dtype=torch.long,
+            )
+
+        cached_parameter_names = getattr(
+            layer.expert_cache,
+            "cached_parameter_names",
+            (),
+        )
+        
+        slot_list = slot_ids.tolist()
+        expert_list = local_ids.tolist()
+        total_experts = len(slot_list)
+        for start_idx in range(0, total_experts, chunk_size):
+            end_idx = min(start_idx + chunk_size, total_experts)
+            chunk_slots = slot_list[start_idx:end_idx]
+            chunk_experts = expert_list[start_idx:end_idx]
+
+            for slot_id, expert_id in zip(chunk_slots, chunk_experts):
+                for param_name in cached_parameter_names:
+                    cache_param = getattr(self, param_name)
+                    layer_param = getattr(layer, param_name)
+                    cache_param[slot_id].copy_(
+                        layer_param[expert_id].pin_memory(),
+                        non_blocking=True,
+                    )
+                
+            torch.cuda.current_stream().synchronize()
 
 
 class ExpertCache(nn.Module):
@@ -221,6 +181,7 @@ class ExpertCache(nn.Module):
         # Bound at model init so we can reuse FusedMoE's loader logic.
         self.owner_fused_moe: FusedMoE | None = None
         self.cached_parameter_names: tuple[str, ...] = ()
+        self.prefetch_executor = ThreadPoolExecutor(max_workers=1)
 
     # NOTE(ducct): custom weight loader for expert cache
     def cached_weight_loader(
@@ -320,19 +281,7 @@ class ExpertCache(nn.Module):
             owner_fused_moe,
             self.cached_parameter_names,
         )
-        # OLD(ducct): explicit MXFP4-only registration.
-        # self.register_parameter("expert_cache_ping_w13_weight", self.ping_buffer.w13_weight)
-        # set_weight_attrs(self.ping_buffer.w13_weight, extra_weight_attrs)
-        # self.register_parameter("expert_cache_ping_w13_weight_scale", self.ping_buffer.w13_weight_scale)
-        # set_weight_attrs(self.ping_buffer.w13_weight_scale, extra_weight_attrs)
-        # self.register_parameter("expert_cache_ping_w13_bias", self.ping_buffer.w13_bias)
-        # set_weight_attrs(self.ping_buffer.w13_bias, extra_weight_attrs)
-        # self.register_parameter("expert_cache_ping_w2_weight", self.ping_buffer.w2_weight)
-        # set_weight_attrs(self.ping_buffer.w2_weight, extra_weight_attrs)
-        # self.register_parameter("expert_cache_ping_w2_weight_scale", self.ping_buffer.w2_weight_scale)
-        # set_weight_attrs(self.ping_buffer.w2_weight_scale, extra_weight_attrs)
-        # self.register_parameter("expert_cache_ping_w2_bias", self.ping_buffer.w2_bias)
-        # set_weight_attrs(self.ping_buffer.w2_bias, extra_weight_attrs)
+
         for param_name in self.cached_parameter_names:
             param = getattr(self.ping_buffer, param_name)
             self.register_parameter(f"expert_cache_ping_{param_name}", param)
@@ -342,19 +291,7 @@ class ExpertCache(nn.Module):
             owner_fused_moe,
             self.cached_parameter_names,
         )
-        # OLD(ducct): explicit MXFP4-only registration.
-        # self.register_parameter("expert_cache_pong_w13_weight", self.pong_buffer.w13_weight)
-        # set_weight_attrs(self.pong_buffer.w13_weight, extra_weight_attrs)
-        # self.register_parameter("expert_cache_pong_w13_weight_scale", self.pong_buffer.w13_weight_scale)
-        # set_weight_attrs(self.pong_buffer.w13_weight_scale, extra_weight_attrs)
-        # self.register_parameter("expert_cache_pong_w13_bias", self.pong_buffer.w13_bias)
-        # set_weight_attrs(self.pong_buffer.w13_bias, extra_weight_attrs)
-        # self.register_parameter("expert_cache_pong_w2_weight", self.pong_buffer.w2_weight)
-        # set_weight_attrs(self.pong_buffer.w2_weight, extra_weight_attrs)
-        # self.register_parameter("expert_cache_pong_w2_weight_scale", self.pong_buffer.w2_weight_scale)
-        # set_weight_attrs(self.pong_buffer.w2_weight_scale, extra_weight_attrs)
-        # self.register_parameter("expert_cache_pong_w2_bias", self.pong_buffer.w2_bias)
-        # set_weight_attrs(self.pong_buffer.w2_bias, extra_weight_attrs)
+
         for param_name in self.cached_parameter_names:
             param = getattr(self.pong_buffer, param_name)
             self.register_parameter(f"expert_cache_pong_{param_name}", param)
@@ -375,22 +312,36 @@ class ExpertCache(nn.Module):
 
     def prefetch(
         self,
-        predicted_expert_ids,
-        prefetch_fn: Callable[[], None] | None = None,
+        layer: FusedMoE,
+        p_ids: torch.Tensor,
         stream: torch.cuda.Stream | None = None,
+        inactive_buffer: ExpertBuffer | None = None,
     ):
-        # NOTE(ducct): mark inactive buffer unavailable and record completion event.
-        inactive_cache = self.get_inactive_buffer()
-        inactive_cache.avail = False
-        if torch.cuda.is_available():
-            if stream is None:
-                stream = torch.cuda.current_stream()
-            with torch.cuda.stream(stream):
-                if prefetch_fn is not None:
-                    prefetch_fn()
-                inactive_cache.prefetch_event = torch.cuda.Event()
-                inactive_cache.prefetch_event.record(stream)
-        else:
-            if prefetch_fn is not None:
-                prefetch_fn()
-            inactive_cache.avail = True
+        inactive_buffer.avail = False
+        
+        inactive_buffer.cpu_done_event.clear()
+        target_device = inactive_buffer.w13_weight.device
+        self.prefetch_executor.submit(
+            self.back_ground_prefetch, layer, inactive_buffer, p_ids, stream, target_device)
+            
+    def back_ground_prefetch(
+        self,
+        layer: FusedMoE,
+        inactive_buffer: ExpertBuffer,
+        p_ids: torch.Tensor,
+        stream: torch.cuda.Stream | None,
+        target_device: torch.device,
+    ):
+        try:
+            torch.cuda.set_device(target_device)
+            if torch.cuda.is_available():
+                if stream is None:
+                    stream = torch.cuda.current_stream()
+                with torch.cuda.stream(stream):
+                    inactive_buffer.chunking_prefetch(layer, p_ids, chunk_size=self.owner_fused_moe.top_k //2) 
+                    inactive_buffer.prefetch_event = torch.cuda.Event()
+                    inactive_buffer.prefetch_event.record(stream)
+            else:
+                inactive_buffer.avail = True
+        finally:
+            inactive_buffer.cpu_done_event.set()

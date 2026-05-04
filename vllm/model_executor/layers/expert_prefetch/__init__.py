@@ -11,6 +11,7 @@ from vllm.model_executor.layers.expert_prefetch.expert_predictor import (
 )
 
 from vllm.model_executor.layers.expert_prefetch.oracle_predictor import OraclePredictor
+from vllm.model_executor.layers.expert_prefetch.fate_predictor import FatePredictor
 
 _config: dict[str, Any] | None = None
 
@@ -32,6 +33,8 @@ __all__ = [
     "ExpertBuffer",
     "ExpertCache",
     "ExpertPredictorModel",
+    "OraclePredictor",
+    "FatePredictor",
     "override_config",
     "get_config",
 ]

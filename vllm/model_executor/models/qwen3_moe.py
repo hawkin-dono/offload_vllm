@@ -643,13 +643,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 self._prefetch_stream = torch.cuda.Stream()
                 prefetch_stream = self._prefetch_stream
 
-            # # 1) D2H copy on prefetch stream
-            # # with torch.profiler.record_function("expert_prefetch.d2h_hidden_states"):
-            # with torch.cuda.stream(prefetch_stream):
-            #     hs_cpu = hidden_states.detach().to("cpu", non_blocking=True)
-            # prefetch_stream.synchronize() # ensure d2h done before CPU prediction
-
-            # 2) NOTE(hieuvt): handle seq_id
             moe = next_layer.mlp.experts
             with torch.profiler.record_function("ducct::expert_predictor"):
                 fate_predictor = getattr(self, "fate_predictor", None)
@@ -674,15 +667,10 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 moe.cached_expert_ids_pong = predicted_ids
             else:
                 moe.cached_expert_ids_ping = predicted_ids
-            # 3) H2D prefetch on prefetch stream
-            def do_prefetch():
-                # with torch.profiler.record_function("expert_prefetch.fetch_on_demand"):
-                    inactive_bf = moe.expert_cache.get_inactive_buffer()
-                    inactive_bf.fetch_on_demand(moe, predicted_ids)
+                
+            inactive_buffer = moe.expert_cache.get_inactive_buffer()
+            moe.expert_cache.prefetch(moe, predicted_ids, prefetch_stream, inactive_buffer)
 
-            with torch.cuda.stream(prefetch_stream):
-                with torch.profiler.record_function("ducct::prefetch"):
-                    moe.expert_cache.prefetch(predicted_ids, prefetch_fn=do_prefetch, stream=prefetch_stream)
 
         # Fully Connected
         hidden_states = self.mlp(hidden_states, running_context[0], running_context[1])
