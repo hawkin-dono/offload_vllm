@@ -58,7 +58,8 @@ class OraclePredictor:
         if not predictions:
             return torch.tensor([], device=self.device, dtype=torch.int32)
         res = torch.cat(predictions)
-        res = res[:int(len(res)*self.acc)]  # Simulate prediction errors by keeping only a fraction of the predictions
+        padding = len(res) - int(len(res)*self.acc)
+        res[int(len(res)*self.acc):] = torch.arange(padding, device=self.device, dtype=torch.int32)  # Simulate prediction errors by keeping only a fraction of the predictions
         return res
     
 def main():

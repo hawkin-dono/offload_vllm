@@ -640,31 +640,15 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 self._prefetch_stream = torch.cuda.Stream()
                 prefetch_stream = self._prefetch_stream
 
-            # # 1) D2H copy on prefetch stream
-            # # with torch.profiler.record_function("expert_prefetch.d2h_hidden_states"):
-            # with torch.cuda.stream(prefetch_stream):
-            #     hs_cpu = hidden_states.detach().to("cpu", non_blocking=True)
-            # prefetch_stream.synchronize() # ensure d2h done before CPU prediction
-
             # 2) NOTE(hieuvt): handle seq_id
             moe = next_layer.mlp.experts
-            with torch.profiler.record_function("ducct::expert_predictor"):
                 
-                predicted_ids = self.expert_predictor.predict_experts_batch(
-                    running_context[0], running_context[1], layer_ids= self.layer_id + 1)
-                predicted_ids = predicted_ids.reshape(-1)
-                predicted_ids = torch.unique(predicted_ids)
-                if ENABLE_ACCURACY_TRACKING:
-                    accuracy_tracker.log_predicted(running_context[0], running_context[1], self.layer_id + 1, predicted_ids)
-                # with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
-                #     # for req, step in zip(running_context[0], running_context[1]):
-                #         # f.write(f"[GPU Layer] Request: {req} đang ở token thứ: {step}\n")
-                #     f.write(f"[Predicted IDs] req: {running_context[0]}, step: {running_context[1]}, layer_id: {self.layer_id + 1}, predicted_ids: {predicted_ids.tolist()}\n")
-
-                # )  # CPU
-                # predicted_ids = torch.tensor([0, 1, 2, 3], device="cpu")
-            # NOTE(ducct):Normalize predicted ids to a unique 1D list (cache expects <= num_experts).
-            # with torch.profiler.record_function("expert_ids.check_and_normalize"):
+            predicted_ids = self.expert_predictor.predict_experts_batch(
+                running_context[0], running_context[1], layer_ids= self.layer_id + 1)
+            predicted_ids = predicted_ids.reshape(-1)
+            predicted_ids = torch.unique(predicted_ids)
+            if ENABLE_ACCURACY_TRACKING:
+                accuracy_tracker.log_predicted(running_context[0], running_context[1], self.layer_id + 1, predicted_ids)
             
             max_cache = moe.expert_cache.ping_buffer.w13_weight.shape[0]
             if predicted_ids.numel() > max_cache:
@@ -675,16 +659,11 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 moe.cached_expert_ids_pong = predicted_ids
             else:
                 moe.cached_expert_ids_ping = predicted_ids
-            # 3) H2D prefetch on prefetch stream
-            def do_prefetch():
-                # with torch.profiler.record_function("expert_prefetch.fetch_on_demand"):
-                    inactive_bf = moe.expert_cache.get_inactive_buffer()
-                    inactive_bf.fetch_on_demand(moe, predicted_ids)
+                
+            inactive_buffer = moe.expert_cache.get_inactive_buffer()
+            moe.expert_cache.prefetch(moe, predicted_ids, prefetch_stream, inactive_buffer)
 
-            with torch.cuda.stream(prefetch_stream):
-                with torch.profiler.record_function("ducct::prefetch"):
-                    moe.expert_cache.prefetch(predicted_ids, prefetch_fn=do_prefetch, stream=prefetch_stream)
-
+            
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states, running_context[0], running_context[1])
@@ -743,6 +722,7 @@ class Qwen3MoeModel(nn.Module):
         if owner_fused_moe is None:
             raise RuntimeError("Failed to find a local FusedMoE layer for expert cache.")
         self.expert_cache.create_cache(owner_fused_moe=owner_fused_moe)
+        self.expert_cache.__dict__["topk"] = owner_fused_moe.top_k
         # Share the model-level expert cache across all MoE layers.
         for layer in self.layers:
             if isinstance(layer, PPMissingLayer):
@@ -750,6 +730,7 @@ class Qwen3MoeModel(nn.Module):
             # Keep shared cache reachable without registering as a submodule
             # to avoid per-layer naming prefixes in state_dict/params.
             layer.mlp.experts.__dict__["expert_cache"] = self.expert_cache
+            # layer.mlp.experts.expert_cache.__dict__["topk"] = layer.mlp.experts.top_k    
 
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -760,6 +741,7 @@ class Qwen3MoeModel(nn.Module):
         self.aux_hidden_state_layers: tuple[int, ...] = ()
         # NOTE(ducct): 
         self._hidden_state_step = 0
+        
 
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:

@@ -32,6 +32,7 @@ __all__ = [
     "ExpertBuffer",
     "ExpertCache",
     "ExpertPredictorModel",
+    "OraclePredictor",
     "override_config",
     "get_config",
 ]
