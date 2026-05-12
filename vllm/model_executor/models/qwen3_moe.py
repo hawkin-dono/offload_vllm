@@ -81,7 +81,7 @@ import os
 from typing import Dict, List 
 from pathlib import Path
 
-from vllm.model_executor.layers.expert_prefetch import ExpertPredictionModel, ExpertCache, OraclePredictor
+from vllm.model_executor.layers.expert_prefetch import ExpertPredictionModel, ExpertCache, OraclePredictor, MultiCheckpointExpertPredictor
 from vllm.forward_context import get_forward_context
 
 # Hidden-state dump (for correctness checks)
@@ -264,8 +264,6 @@ class AccuracyTracker:
         
 accuracy_tracker = AccuracyTracker()
 
-
-
 class Qwen3MoeMLP(nn.Module):
     def __init__(
         self,
@@ -387,8 +385,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         
-        expert_ids = torch.unique(torch.topk(router_logits, k=self.experts.top_k, dim=-1).indices).tolist()
         if ENABLE_ACCURACY_TRACKING:
+            expert_ids = torch.unique(torch.topk(router_logits, k=self.experts.top_k, dim=-1).indices).tolist()
             accuracy_tracker.log_grth(req_id, step, self.layer_idx, expert_ids)
         
         # with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
@@ -553,7 +551,7 @@ def get_running_context():
     return ([], [])
     
 class Qwen3MoeDecoderLayer(nn.Module):
-    def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
+    def __init__(self, vllm_config: VllmConfig, prefix: str = "", expert_predictor: MultiCheckpointExpertPredictor = None) -> None:
         super().__init__()
 
         config = vllm_config.model_config.hf_text_config
@@ -610,10 +608,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
         # NOTE(ducct): add expert predictor
         self.top_k = self.mlp.experts.top_k
-        # self.expert_predictor = OraclePredictor(data_path="/home/hieuvt/vllm-hpclab/oracle_cache.pkl", top_k=self.top_k, device="cpu")
-        self.expert_predictor = ExpertPredictionModel.load_from_checkpoint("vllm/model_executor/layers/expert_prefetch/checkpoints/epoch=06-val_acc=0.8151.ckpt")
-        self.expert_predictor = self.expert_predictor.to("cuda:0")
-        self.expert_predictor.eval()  
+        self.expert_predictor = expert_predictor
+        self.predict_input_type = self.expert_predictor.layer_to_input.get(self.layer_id, None)
 
     def forward(
         self,
@@ -630,19 +626,17 @@ class Qwen3MoeDecoderLayer(nn.Module):
         
         next_layer = getattr(self, "next_layer", None)
         running_context = get_running_context()
-        if next_layer is not None and hidden_states.is_cuda:
+        if next_layer is not None and hidden_states.is_cuda and self.predict_input_type == "attn_input":
             prefetch_stream = getattr(self, "_prefetch_stream", None)
             if prefetch_stream is None:
                 self._prefetch_stream = torch.cuda.Stream()
                 prefetch_stream = self._prefetch_stream
-
-            # 2) NOTE(hieuvt): handle seq_id
+                
             moe = next_layer.mlp.experts
                 
             tmp_hidden_states = residual.detach()  # Detach to avoid unnecessary autograd tracking
-            layer_ids = torch.full((hidden_states.shape[0],), self.layer_id, dtype=torch.long, device=tmp_hidden_states.device)
             predicted_ids = self.expert_predictor.predict_experts_batch(
-                tmp_hidden_states, layer_ids=layer_ids
+                tmp_hidden_states, self.layer_id
             )
             if ENABLE_ACCURACY_TRACKING:
                 accuracy_tracker.log_predicted(running_context[0], running_context[1], self.layer_id + 1, predicted_ids)
@@ -666,6 +660,35 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        
+        if next_layer is not None and hidden_states.is_cuda and self.predict_input_type == "moe_input":
+            prefetch_stream = getattr(self, "_prefetch_stream", None)
+            if prefetch_stream is None:
+                self._prefetch_stream = torch.cuda.Stream()
+                prefetch_stream = self._prefetch_stream
+
+            moe = next_layer.mlp.experts
+                
+            tmp_hidden_states = hidden_states.detach()  # Detach to avoid unnecessary autograd tracking
+            predicted_ids = self.expert_predictor.predict_experts_batch(
+                tmp_hidden_states, self.layer_id
+            )
+            if ENABLE_ACCURACY_TRACKING:
+                accuracy_tracker.log_predicted(running_context[0], running_context[1], self.layer_id + 1, predicted_ids)
+            
+            max_cache = moe.expert_cache.ping_buffer.w13_weight.shape[0]
+            if predicted_ids.numel() > max_cache:
+                predicted_ids = predicted_ids[:max_cache]
+
+            # with torch.profiler.record_function("expert_ids.h2d_cache_ids"):
+            if moe.expert_cache.active_buffer == "ping":
+                moe.cached_expert_ids_pong = predicted_ids
+            else:
+                moe.cached_expert_ids_ping = predicted_ids
+                
+            inactive_buffer = moe.expert_cache.get_inactive_buffer()
+            moe.expert_cache.prefetch(moe, predicted_ids, prefetch_stream, inactive_buffer)
+        
         hidden_states = self.mlp(hidden_states, running_context[0], running_context[1])
         
         if not next_layer: # reset all prefetch buffer
@@ -694,12 +717,22 @@ class Qwen3MoeModel(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.embed_tokens",
         )
+        
+        # Must match routed experts (e.g. 8), not config.num_experts (e.g. 128).
+        # Passing num_experts makes topk return every expert index and breaks prefetch / accuracy logs.
+        top_k = config.num_experts_per_tok
+        self.expert_predictor = MultiCheckpointExpertPredictor(
+            checkpoint_dir="vllm/model_executor/layers/expert_prefetch/checkpoints/final/",
+            top_k=top_k,
+            device="cuda",
+        )
+        
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: Qwen3MoeDecoderLayer(vllm_config=vllm_config, prefix=prefix),
+            lambda prefix: Qwen3MoeDecoderLayer(vllm_config=vllm_config, prefix=prefix, expert_predictor=self.expert_predictor),
             prefix=f"{prefix}.layers",
         )
-
+        
         # NOTE(ducct): Link neighboring layers without registering as submodules.
         for i, layer in enumerate(self.layers):
             if isinstance(layer, PPMissingLayer):

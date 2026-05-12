@@ -8,6 +8,7 @@ from vllm.model_executor.layers.expert_prefetch.expert_cache import (
 
 from vllm.model_executor.layers.expert_prefetch.expert_predictor import (
     ExpertPredictionModel,
+    MultiCheckpointExpertPredictor,
 )
 
 from vllm.model_executor.layers.expert_prefetch.oracle_predictor import OraclePredictor
@@ -32,6 +33,8 @@ __all__ = [
     "ExpertBuffer",
     "ExpertCache",
     "ExpertPredictionModel",
+    "MultiCheckpointExpertPredictor",
+    "OraclePredictor",
     "override_config",
     "get_config",
 ]

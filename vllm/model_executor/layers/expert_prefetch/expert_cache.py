@@ -338,7 +338,7 @@ class ExpertCache(nn.Module):
                 if stream is None:
                     stream = torch.cuda.current_stream()
                 with torch.cuda.stream(stream):
-                    inactive_buffer.chunking_prefetch(layer, p_ids, chunk_size=self.owner_fused_moe.top_k //2) 
+                    inactive_buffer.chunking_prefetch(layer, p_ids, chunk_size= p_ids.numel() // 2) 
                     inactive_buffer.prefetch_event = torch.cuda.Event()
                     inactive_buffer.prefetch_event.record(stream)
             else:
