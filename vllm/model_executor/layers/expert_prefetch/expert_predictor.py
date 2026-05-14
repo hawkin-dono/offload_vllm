@@ -227,9 +227,9 @@ class MultiCheckpointExpertPredictor(nn.Module):
     ) -> torch.Tensor:
         logits = self.forward(hidden_state, layer_id=layer_id)
         if logits.dim() == 3:
-            _, pred_indices = torch.topk(logits, self.top_k, dim=2)
+            _, pred_indices = torch.topk(logits, int(self.top_k * 0.75), dim=2)
         else:
-            _, pred_indices = torch.topk(logits, self.top_k, dim=1)
+            _, pred_indices = torch.topk(logits, int(self.top_k * 0.75), dim=1)
         return torch.unique(pred_indices.cpu().reshape(-1))
 
 
