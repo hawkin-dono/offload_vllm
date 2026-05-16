@@ -234,11 +234,12 @@ class AccuracyTracker:
             
             overlap = len(set_grth.intersection(set_pred))
             self.total_true += overlap
-            self.total_grth += len(set_grth)
+            # self.total_grth += len(set_grth)
+            self.total_grth += min(len(set_grth), len(set_pred))
             
-            if set_grth != set_pred:
+            if overlap != len(set_pred):
                 with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
-                    f.write(f"[Mismatch] key: {key}, grth: {expert_ids}, pred: {pred_ids}\n, acc: {overlap / len(set_grth):.4f} \n")
+                    f.write(f"[Mismatch] key: {key}, grth: {expert_ids}, pred: {pred_ids}\n, acc: {overlap / len(set_pred):.4f} \n")
             else: 
                 with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
                     f.write(f"[Match] key: {key}, experts: {pred_ids}\n")
