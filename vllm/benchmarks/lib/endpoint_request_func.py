@@ -126,6 +126,8 @@ def _update_payload_common(
         payload["ignore_eos"] = request_func_input.ignore_eos
     if request_func_input.extra_body:
         payload.update(request_func_input.extra_body)
+    if request_func_input.request_id is not None:
+        payload["request_id"] = request_func_input.request_id
 
 
 def _update_headers_common(
@@ -135,7 +137,7 @@ def _update_headers_common(
     if request_func_input.extra_headers:
         headers |= request_func_input.extra_headers
     if request_func_input.request_id:
-        headers["x-request-id"] = request_func_input.request_id
+        headers["X-Request-Id"] = request_func_input.request_id
 
 
 async def async_request_openai_completions(

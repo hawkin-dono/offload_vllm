@@ -1219,11 +1219,11 @@ class ShareGPTDataset(BenchmarkDataset):
 
         with open(self.dataset_path, encoding="utf-8") as f:
             self.data = json.load(f)
-        # Filter entries with at least two conversation turns.
+        # Filter entries with at least two conversation turns or text.
         self.data = [
             entry
             for entry in self.data
-            if "conversations" in entry and len(entry["conversations"]) >= 2
+            if ("conversations" in entry and len(entry["conversations"]) >= 2) or "text" in entry
         ]
         random.seed(self.random_seed)
         if not getattr(self, "disable_shuffle", False):
@@ -1246,10 +1246,14 @@ class ShareGPTDataset(BenchmarkDataset):
         for entry in self.data:
             if len(samples) >= num_requests:
                 break
-            prompt, completion = (
-                entry["conversations"][0]["value"],
-                entry["conversations"][1]["value"],
-            )
+            if "text" in entry:
+                prompt = entry["text"]
+                completion = ""
+            else:
+                prompt, completion = (
+                    entry["conversations"][0]["value"],
+                    entry["conversations"][1]["value"],
+                )
 
             lora_request = self.get_random_lora_request(
                 max_loras=max_loras, lora_path=lora_path
@@ -1272,6 +1276,7 @@ class ShareGPTDataset(BenchmarkDataset):
                 mm_content = None
             if enable_multimodal_chat:
                 prompt = self.apply_multimodal_chat_transformation(prompt, mm_content)
+            req_id = str(entry.get("true_req_id", request_id_prefix + str(ind)))
             samples.append(
                 SampleRequest(
                     prompt=prompt,
@@ -1279,7 +1284,7 @@ class ShareGPTDataset(BenchmarkDataset):
                     expected_output_len=new_output_len,
                     lora_request=lora_request,
                     multi_modal_data=mm_content,
-                    request_id=request_id_prefix + str(ind),
+                    request_id=req_id,
                 )
             )
             ind += 1

@@ -84,7 +84,7 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
-
+from vllm.model_executor.layers.expert_prefetch import ExpertCache
 from .interfaces import MixtureOfExperts, SupportsEagle, SupportsLoRA, SupportsPP
 from .utils import (
     PPMissingLayer,
@@ -92,6 +92,7 @@ from .utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+    extract_layer_index, 
 )
 
 if current_platform.is_cuda_alike():
@@ -101,6 +102,89 @@ elif current_platform.is_xpu():
 
 logger = init_logger(__name__)
 
+ 
+import numpy as np 
+import h5py
+class GenerationTracker:
+    def __init__(self, filepath="vllm_hidden_states.h5"):
+        self.filepath = filepath
+        self.data = {}
+    
+    def log(self, req_ids, steps, layer_id, key, tensor):
+        # logger.info(f"[hieuvt]Logging data for layer {layer_id}, key {key}, req_ids {req_ids}, steps {steps}")
+        if isinstance(req_ids, torch.Tensor):
+            req_ids = req_ids.tolist()
+        if isinstance(steps, torch.Tensor):
+            steps = steps.tolist()
+        if not req_ids or not steps:
+            return
+        
+        if isinstance(tensor, torch.Tensor):
+            np_array = tensor.detach().cpu().to(torch.float16).numpy()
+        else:
+            np_array = np.array(tensor, dtype=np.float16)
+    
+        for i, (req_id, step) in enumerate(zip(req_ids, steps)):
+            true_req_id = req_id.split("-")[1]
+            if true_req_id not in self.data:
+                self.data[true_req_id] = {}
+            if step not in self.data[true_req_id]:
+                self.data[true_req_id][step] = {}
+            if layer_id not in self.data[true_req_id][step]:
+                self.data[true_req_id][step][layer_id] = {}
+            current_data = np_array[i]
+            self.data[true_req_id][step][layer_id][key] = current_data
+
+    def save_and_clear(self):
+        if not self.data:
+            return
+        
+        with h5py.File(self.filepath, 'a') as f:
+            for seq_id, steps in self.data.items():
+                seq_group = f.require_group(str(seq_id))
+                for step, layers in steps.items():
+                    step_group = seq_group.require_group(f"step_{step}")
+                    for layer_id, tensors in layers.items():
+                        layer_group = step_group.require_group(f"layer_{layer_id}")
+                        for key, np_array in tensors.items():
+                            if key in layer_group:
+                                del layer_group[key]
+                            layer_group.create_dataset(key, data=np_array, compression="lzf")
+        self.data.clear()
+
+global_tracker = GenerationTracker()
+
+
+def get_running_context():
+    ctx = get_forward_context()
+    
+    req_ids = getattr(ctx, "req_ids", None)
+    
+    if req_ids is None:
+        return {}
+
+    attn_metadata = getattr(ctx, "attn_metadata", None)
+    if attn_metadata is not None:
+        if isinstance(attn_metadata, list):
+            meta_dict = attn_metadata[0] if len(attn_metadata) > 0 else {}
+        else:
+            meta_dict = attn_metadata
+
+        meta = next(iter(meta_dict.values())) if isinstance(meta_dict, dict) and meta_dict else None
+
+        num_computed_tokens = None
+        if meta is not None:
+            if hasattr(meta, "seq_lens"):
+                num_computed_tokens = meta.seq_lens
+            elif hasattr(meta, "num_computed_tokens_cpu"):
+                num_computed_tokens = meta.num_computed_tokens_cpu
+            elif hasattr(meta, "common_attn_metadata") and hasattr(meta.common_attn_metadata, "num_computed_tokens_cpu"):
+                num_computed_tokens = meta.common_attn_metadata.num_computed_tokens_cpu
+
+        if num_computed_tokens is not None:
+            return (req_ids, num_computed_tokens)
+                
+    return ([], [])
 
 class DeepseekAttention(nn.Module):
     """Normal MHA implementation used by Deepseek v1."""
@@ -229,6 +313,7 @@ class DeepseekV2MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
+        # logger.info(f"[hieuvt]Running context in MLP forward: {get_running_context()}")
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -256,6 +341,7 @@ class DeepseekV2MoE(nn.Module):
         self.n_shared_experts: int = config.n_shared_experts
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+        self.layer_idx = extract_layer_index(prefix)
 
         if config.hidden_act != "silu":
             raise ValueError(
@@ -337,6 +423,11 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # get context 
+        running_context = get_running_context()
+        req_ids, steps = running_context[0], running_context[1]
+        # logger.info(f"[hieuvt]Running context in MoE forward: req_ids {req_ids}, steps {steps}")
+        
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
@@ -349,12 +440,19 @@ class DeepseekV2MoE(nn.Module):
 
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoE class
+            router_logits, _ = self.gate(hidden_states)
+            global_tracker.log(req_ids, steps, self.layer_idx, "router_logits", router_logits)
             fused_moe_out = self.experts(
-                hidden_states=hidden_states, router_logits=hidden_states
+                hidden_states=hidden_states, router_logits=hidden_states  # vẫn bị gate gọi lại bên trong
             )
         else:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
+            
+            # --- LOG ROUTER LOGITS ---
+            global_tracker.log(req_ids, steps, getattr(self, "layer_idx", 0), "router_logits", router_logits)
+            # -------------------------
+            
             fused_moe_out = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
@@ -1147,6 +1245,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> torch.Tensor:
+        
+        running_context = get_running_context()
+        
         # Self Attention
         if residual is None:
             residual = hidden_states.clone()
@@ -1190,8 +1291,9 @@ class DeepseekV2DecoderLayer(nn.Module):
 class DeepseekV2Model(nn.Module):
     fall_back_to_pt_during_load = False
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "", expert_cache: ExpertCache | None = None):
         super().__init__()
+        print("[Note] hieuvt: deepseekmoe init here")
 
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
@@ -1227,7 +1329,32 @@ class DeepseekV2Model(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
-
+        self.expert_cache = expert_cache
+        
+        # NOTE(hieuvt): Link neighboring layers without registering as submodules.
+        for i, layer in enumerate(self.layers):
+            if isinstance(layer, PPMissingLayer):
+                continue
+            next_layer = self.layers[i + 1] if i + 1 < len(self.layers) else None
+            layer.__dict__["next_layer"] = next_layer
+            
+        
+        owner_fused_moe = next(
+            (
+                layer.mlp.experts for layer in self.layers
+                if not isinstance(layer, PPMissingLayer) and isinstance(layer.mlp, DeepseekV2MoE)
+            ),
+            None,
+        )
+        if owner_fused_moe is None:
+            raise RuntimeError("Failed to find a local FusedMoE layer for expert cache.")
+        self.expert_cache.create_cache(owner_fused_moe=owner_fused_moe)
+        for layer in self.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
+            if isinstance(layer.mlp, DeepseekV2MoE):
+                layer.mlp.experts.__dict__["expert_cache"] = self.expert_cache
+        
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -1260,11 +1387,13 @@ class DeepseekV2Model(nn.Module):
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(positions, hidden_states, residual)
 
+        
         if not get_pp_group().is_last_rank:
+            global_tracker.save_and_clear()
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
-
+        global_tracker.save_and_clear()
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -1346,8 +1475,11 @@ class DeepseekV2ForCausalLM(
                 "kv_a_proj_with_mqa",
             ]
 
+        self.expert_cache = ExpertCache(
+            num_experts=self.config.n_routed_experts
+        )
         self.model = DeepseekV2Model(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"), expert_cache=self.expert_cache
         )
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
@@ -1461,6 +1593,8 @@ class DeepseekV2ForCausalLM(
         )
 
         params_dict = dict(self.named_parameters())
+        
+        # print(f"[Note] hieuvt: params_dict keys: {list(params_dict.keys())}")
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -1621,6 +1755,15 @@ class DeepseekV2ForCausalLM(
                         weight_loader(param, loaded_weight)
             if not is_fuse_shared_experts_layer:
                 loaded_params.add(name)
+        try:
+            cache_param_names = getattr(self.expert_cache, "cached_parameter_names", ())
+            for param_name in cache_param_names:
+                loaded_params.add(f"expert_cache.expert_cache_ping_{param_name}")
+                loaded_params.add(f"expert_cache.expert_cache_pong_{param_name}")
+        except Exception:
+            raise RuntimeError(
+                "Failed to add expert cache parameters to loaded_params. "
+                "Make sure expert_cache is properly initialized and has attribute cached_parameter_names.")
 
         return loaded_params
 

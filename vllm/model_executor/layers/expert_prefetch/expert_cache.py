@@ -296,7 +296,7 @@ class ExpertCache(nn.Module):
         #     weight_dtype,
         #     scale_dtype,
         # ):
-        self.owner_fused_moe = owner_fused_moe
+        self.__dict__['owner_fused_moe'] = owner_fused_moe
         extra_weight_attrs = {
             "cached_weight_loader": self.cached_weight_loader
         }
