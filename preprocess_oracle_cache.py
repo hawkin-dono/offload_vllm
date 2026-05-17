@@ -44,7 +44,7 @@ if __name__ == "__main__":
     # Thay đổi đường dẫn này theo đúng file H5 lớn nhất của bạn
     # Ví dụ: file data của bạn là vllm_hidden_states.h5
     preprocess(
-        h5_path="/home/hieuvt/vllm-hpclab/vllm_hidden_states_1seq.h5", 
-        output_pkl="/home/hieuvt/vllm-hpclab/oracle_cache.pkl", 
-        top_k=8
+        h5_path="deepseek_moe_vllm_hidden_states.h5", 
+        output_pkl="/home/hieuvt/vllm-hpclab/deepseek_moe_oracle_cache.pkl", 
+        top_k=6
     )
