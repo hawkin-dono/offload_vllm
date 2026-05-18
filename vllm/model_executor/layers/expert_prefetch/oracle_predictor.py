@@ -64,9 +64,10 @@ class OraclePredictor:
     
 def main():
     # Update main function to point to the new pickle file instead
-    predictor = OraclePredictor(data_path="/home/hieuvt/vllm-hpclab/oracle_cache.pkl", top_k=8, device="cpu")
-    seq = ['cmpl-seq_004-0']
-    step = [313]
+    # predictor = OraclePredictor(data_path="/home/hieuvt/vllm-hpclab/oracle_cache.pkl", top_k=8, device="cpu")
+    predictor = OraclePredictor(data_path="vllm/model_executor/layers/expert_prefetch/checkpoints/qwen3_moe/oracle/deepseek_moe_oracle_cache.pkl", top_k=4, device="cpu")
+    seq = ['cmpl-seq_044-0']
+    step = [50]
     layer_id = 9
     predictions = predictor.predict_experts_batch(seq, step, layer_id)
     print(predictions)
