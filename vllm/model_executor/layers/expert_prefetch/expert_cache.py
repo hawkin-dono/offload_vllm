@@ -155,21 +155,31 @@ class ExpertBuffer(nn.Module):
         slot_list = slot_ids.tolist()
         expert_list = local_ids.tolist()
         total_experts = len(slot_list)
-        for start_idx in range(0, total_experts, chunk_size):
-            end_idx = min(start_idx + chunk_size, total_experts)
-            chunk_slots = slot_list[start_idx:end_idx]
-            chunk_experts = expert_list[start_idx:end_idx]
+        
+        #prefetch 1 expert first  
+        first_expert = expert_list[0] 
+        first_slot = slot_list[0] 
+        for param_name in cached_parameter_names:
+            cache_param = getattr(self, param_name)
+            layer_param = getattr(layer, param_name)
+            cache_param[first_slot].copy_(
+                layer_param[first_expert].pin_memory(),
+                non_blocking=True,
+            )
+        torch.cuda.current_stream().synchronize()
+        
+        chunk_slots = slot_list[1:]
+        chunk_experts = expert_list[1:]
 
-            for slot_id, expert_id in zip(chunk_slots, chunk_experts):
-                for param_name in cached_parameter_names:
-                    cache_param = getattr(self, param_name)
-                    layer_param = getattr(layer, param_name)
-                    cache_param[slot_id].copy_(
-                        layer_param[expert_id].pin_memory(),
-                        non_blocking=True,
-                    )
-                
-            torch.cuda.current_stream().synchronize()
+        for slot_id, expert_id in zip(chunk_slots, chunk_experts):
+            for param_name in cached_parameter_names:
+                cache_param = getattr(self, param_name)
+                layer_param = getattr(layer, param_name)
+                cache_param[slot_id].copy_(
+                    layer_param[expert_id].pin_memory(),
+                    non_blocking=True,
+                )
+        torch.cuda.current_stream().synchronize()
 
 
 class ExpertCache(nn.Module):
@@ -257,7 +267,8 @@ class ExpertCache(nn.Module):
         #     weight_dtype,
         #     scale_dtype,
         # ):
-        self.owner_fused_moe = owner_fused_moe
+        # self.owner_fused_moe = owner_fused_moe
+        self.__dict__["owner_fused_moe"] = owner_fused_moe
         extra_weight_attrs = {
             "cached_weight_loader": self.cached_weight_loader
         }

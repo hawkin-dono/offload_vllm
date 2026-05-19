@@ -27,7 +27,8 @@
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
-from typing import Any
+from typing import Any, Optional
+import os 
 
 import torch
 from torch import nn
@@ -84,7 +85,7 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
-
+from vllm.model_executor.layers.expert_prefetch import ExpertCache, OraclePredictor, ExpertPredictionModel, MultiCheckpointExpertPredictor
 from .interfaces import MixtureOfExperts, SupportsEagle, SupportsLoRA, SupportsPP
 from .utils import (
     PPMissingLayer,
@@ -92,6 +93,7 @@ from .utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+    extract_layer_index, 
 )
 
 if current_platform.is_cuda_alike():
@@ -101,6 +103,110 @@ elif current_platform.is_xpu():
 
 logger = init_logger(__name__)
 
+ENABLE_ACCURACY_TRACKING = os.getenv("ENABLE_ACCURACY_TRACKING", "0") == "1"
+
+class AccuracyTracker:
+    def __init__(self):
+        self.grth = {}
+        self.predicted = {}
+        self.total_true = 0
+        self.total_grth = 0
+        
+    def check_dummy_req(self, req_ids: list[str]) -> bool:
+        if not req_ids:
+            return True
+        req_id = req_ids[0]
+        if req_id.startswith("cmpl") or req_id.startswith("chatcmpl"):
+            req_id = req_id.split("-")[1] 
+        if len(req_id) >= 8: 
+            return True
+
+    def _make_key(self, req_ids, steps, layer_id):
+        if isinstance(req_ids, list):
+            req_ids = tuple(req_ids)
+        if isinstance(steps, list):
+            steps = tuple(steps)
+        elif isinstance(steps, torch.Tensor):
+            steps = tuple(steps.tolist())
+        return (req_ids, steps, layer_id)
+
+    def log_grth(self, req_ids, steps, layer_id, expert_ids):
+        if self.check_dummy_req(req_ids):
+            return 
+        key = self._make_key(req_ids, steps, layer_id)
+        if isinstance(expert_ids, torch.Tensor):
+            expert_ids = expert_ids.tolist()
+        elif not isinstance(expert_ids, list):
+            expert_ids = list(expert_ids)
+            
+        self.grth[key] = expert_ids
+        if key in self.predicted:
+            pred_ids = self.predicted[key]
+            set_grth = set(expert_ids)
+            set_pred = set(pred_ids)
+            
+            overlap = len(set_grth.intersection(set_pred))
+            self.total_true += overlap
+            # self.total_grth += len(set_grth)
+            self.total_grth += min(len(set_grth), len(set_pred))
+            
+            if overlap != len(set_pred):
+                with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
+                    f.write(f"[Mismatch] key: {key}, grth: {expert_ids}, pred: {pred_ids}\n, acc: {overlap / len(set_pred):.4f} \n")
+            else: 
+                with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
+                    f.write(f"[Match] key: {key}, experts: {pred_ids}\n")
+            
+            
+    def log_predicted(self, req_ids, steps, layer_id, predicted_ids):
+        if self.check_dummy_req(req_ids):
+            return
+        key = self._make_key(req_ids, steps, layer_id)
+        if isinstance(predicted_ids, torch.Tensor):
+            predicted_ids = predicted_ids.tolist()
+        elif not isinstance(predicted_ids, list):
+            predicted_ids = list(predicted_ids)
+            
+        acc = self.total_true / self.total_grth if self.total_grth > 0 else 0.0
+            
+        if key not in self.predicted:
+            with open("/tmp/vllm_gpu_layer_log.txt", "a") as f:
+                f.write(f"[Accuracy] Overall Accuracy: {acc:.4f} (Overlap: {self.total_true}, Total Grth: {self.total_grth})\n")
+            
+        self.predicted[key] = predicted_ids
+        
+accuracy_tracker = AccuracyTracker()
+
+def get_running_context():
+    ctx = get_forward_context()
+    
+    req_ids = getattr(ctx, "req_ids", None)
+    
+    if req_ids is None:
+        return {}
+
+    attn_metadata = getattr(ctx, "attn_metadata", None)
+    if attn_metadata is not None:
+        if isinstance(attn_metadata, list):
+            meta_dict = attn_metadata[0] if len(attn_metadata) > 0 else {}
+        else:
+            meta_dict = attn_metadata
+
+        meta = next(iter(meta_dict.values())) if isinstance(meta_dict, dict) and meta_dict else None
+
+        num_computed_tokens = None
+        if meta is not None:
+            if hasattr(meta, "seq_lens"):
+                num_computed_tokens = meta.seq_lens
+            elif hasattr(meta, "num_computed_tokens_cpu"):
+                num_computed_tokens = meta.num_computed_tokens_cpu
+            elif hasattr(meta, "common_attn_metadata") and hasattr(meta.common_attn_metadata, "num_computed_tokens_cpu"):
+                num_computed_tokens = meta.common_attn_metadata.num_computed_tokens_cpu
+
+        if num_computed_tokens is not None:
+            return (req_ids, num_computed_tokens)
+                
+    return ([], [])
 
 class DeepseekAttention(nn.Module):
     """Normal MHA implementation used by Deepseek v1."""
@@ -229,6 +335,7 @@ class DeepseekV2MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
+        # logger.info(f"[hieuvt]Running context in MLP forward: {get_running_context()}")
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -256,6 +363,7 @@ class DeepseekV2MoE(nn.Module):
         self.n_shared_experts: int = config.n_shared_experts
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+        self.layer_idx = extract_layer_index(prefix)
 
         if config.hidden_act != "silu":
             raise ValueError(
@@ -337,6 +445,11 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # get context 
+        running_context = get_running_context()
+        req_ids, steps = running_context[0], running_context[1]
+        # logger.info(f"[hieuvt]Running context in MoE forward: req_ids {req_ids}, steps {steps}")
+        
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
@@ -349,12 +462,33 @@ class DeepseekV2MoE(nn.Module):
 
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoE class
+            if ENABLE_ACCURACY_TRACKING:
+                router_logits, _ = self.gate(hidden_states)
+                if getattr(self.experts, "use_grouped_topk", False):
+                    from vllm.model_executor.layers.fused_moe.fused_moe import grouped_topk
+                    topk_weights, topk_indices = grouped_topk(
+                        hidden_states=hidden_states,
+                        gating_output=router_logits,
+                        topk=self.experts.top_k,
+                        num_expert_group=self.experts.num_expert_group,
+                        topk_group=self.experts.topk_group,
+                        e_score_correction_bias=self.gate.e_score_correction_bias,
+                        renormalize=self.experts.renormalize,
+                    )
+                else:
+                    topk_indices = torch.topk(router_logits, self.experts.top_k, dim=-1).indices
+                grth_indices = torch.unique(topk_indices.reshape(-1)).tolist()
+                accuracy_tracker.log_grth(req_ids, steps, self.layer_idx, grth_indices)
             fused_moe_out = self.experts(
                 hidden_states=hidden_states, router_logits=hidden_states
             )
         else:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
+            if ENABLE_ACCURACY_TRACKING:
+                topk_indices = torch.topk(router_logits, self.experts.top_k, dim=-1).indices
+                grth_indices = torch.unique(topk_indices.reshape(-1)).tolist()
+                accuracy_tracker.log_grth(req_ids, steps, self.layer_idx, grth_indices)
             fused_moe_out = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
@@ -1062,6 +1196,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         prefix: str,
         config: DeepseekV2Config | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        expert_predictor: Optional[ExpertPredictionModel] = None,
     ) -> None:
         super().__init__()
 
@@ -1140,6 +1275,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
+        self.expert_predictor = expert_predictor
+        self.top_k = config.num_experts_per_tok
+        self.predict_input_type = self.expert_predictor.layer_to_input.get(self.layer_idx, None)
 
     def forward(
         self,
@@ -1147,12 +1285,43 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> torch.Tensor:
-        # Self Attention
         if residual is None:
             residual = hidden_states.clone()
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            
+        next_layer = getattr(self, "next_layer", None)
+        running_context = get_running_context()
+        if next_layer is not None and hidden_states.is_cuda and self.predict_input_type == "attn_input":
+            prefetch_stream = getattr(self, "_prefetch_stream", None)
+            if prefetch_stream is None:
+                self._prefetch_stream = torch.cuda.Stream()
+                prefetch_stream = self._prefetch_stream
+                
+            moe = next_layer.mlp.experts
+                
+            tmp_hidden_states = residual.detach()  # Detach to avoid unnecessary autograd tracking
+            predicted_ids = self.expert_predictor.predict_experts_batch(
+                tmp_hidden_states, self.layer_id
+            )
+            if ENABLE_ACCURACY_TRACKING:
+                accuracy_tracker.log_predicted(running_context[0], running_context[1], self.layer_id + 1, predicted_ids)
+            
+            max_cache = moe.expert_cache.ping_buffer.w13_weight.shape[0]
+            if predicted_ids.numel() > max_cache:
+                predicted_ids = predicted_ids[:max_cache]
+
+            # with torch.profiler.record_function("expert_ids.h2d_cache_ids"):
+            if moe.expert_cache.active_buffer == "ping":
+                moe.cached_expert_ids_pong = predicted_ids
+            else:
+                moe.cached_expert_ids_ping = predicted_ids
+                
+            inactive_buffer = moe.expert_cache.get_inactive_buffer()
+            moe.expert_cache.prefetch(moe, predicted_ids, prefetch_stream, inactive_buffer)
+
+        
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -1162,9 +1331,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             not isinstance(self.self_attn, DeepseekAttention)
             and hidden_states.dtype == torch.float16
         ):
-            # Fix FP16 overflow
-            # We scale both hidden_states and residual before
-            # rmsnorm, and rmsnorm result would not affect by scale.
             hidden_states *= 1.0 / self.routed_scaling_factor
             if self.layer_idx == 0:
                 # The residual is shared by all layers, we only scale it on
@@ -1173,15 +1339,43 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        
+        if next_layer is not None and hidden_states.is_cuda and self.predict_input_type == "moe_input":
+            prefetch_stream = getattr(self, "_prefetch_stream", None)
+            if prefetch_stream is None:
+                self._prefetch_stream = torch.cuda.Stream()
+                prefetch_stream = self._prefetch_stream
+
+            moe = next_layer.mlp.experts
+                
+            tmp_hidden_states = hidden_states.detach()  # Detach to avoid unnecessary autograd tracking
+            predicted_ids = self.expert_predictor.predict_experts_batch(
+                tmp_hidden_states, self.layer_idx
+            )
+            if ENABLE_ACCURACY_TRACKING:
+                accuracy_tracker.log_predicted(running_context[0], running_context[1], self.layer_idx + 1, predicted_ids)
+            
+            max_cache = moe.expert_cache.ping_buffer.w13_weight.shape[0]
+            if predicted_ids.numel() > max_cache:
+                predicted_ids = predicted_ids[:max_cache]
+
+            # with torch.profiler.record_function("expert_ids.h2d_cache_ids"):
+            if moe.expert_cache.active_buffer == "ping":
+                moe.cached_expert_ids_pong = predicted_ids
+            else:
+                moe.cached_expert_ids_ping = predicted_ids
+                
+            inactive_buffer = moe.expert_cache.get_inactive_buffer()
+            moe.expert_cache.prefetch(moe, predicted_ids, prefetch_stream, inactive_buffer)
+            
         hidden_states = self.mlp(hidden_states)
 
         if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
-            # Fix FP16 overflow
-            # Scaling the DeepseekV2MLP output, it is the input of
-            # input_layernorm of next decoder layer.
-            # The scaling of DeepseekV2MOE output would be done in the forward
-            # of DeepseekV2MOE
             hidden_states *= 1.0 / self.routed_scaling_factor
+        
+        if not next_layer: # reset all prefetch buffer
+            self.mlp.experts.expert_cache.cached_expert_ids_ping = torch.empty(0, dtype=torch.int32) 
+            self.mlp.experts.expert_cache.cached_expert_ids_pong = torch.empty(0, dtype=torch.int32)
 
         return hidden_states, residual
 
@@ -1190,8 +1384,9 @@ class DeepseekV2DecoderLayer(nn.Module):
 class DeepseekV2Model(nn.Module):
     fall_back_to_pt_during_load = False
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "", expert_cache: ExpertCache | None = None):
         super().__init__()
+        print("[Note] hieuvt: deepseekmoe init here")
 
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
@@ -1210,6 +1405,14 @@ class DeepseekV2Model(nn.Module):
             )
         else:
             topk_indices_buffer = None
+            
+        self.expert_cache = expert_cache
+        top_k = config.num_experts_per_tok
+        self.expert_predictor = MultiCheckpointExpertPredictor(
+            checkpoint_dir="vllm/model_executor/layers/expert_prefetch/checkpoints/deepseek_v2/oracle/deepseekmoe",
+            top_k=top_k,
+            device="cuda",
+        )
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1223,11 +1426,34 @@ class DeepseekV2Model(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV2DecoderLayer(
-                vllm_config, prefix, topk_indices_buffer=topk_indices_buffer
+                vllm_config, prefix, topk_indices_buffer=topk_indices_buffer, expert_predictor=self.expert_predictor
             ),
             prefix=f"{prefix}.layers",
         )
-
+        
+        # NOTE(hieuvt): Link neighboring layers without registering as submodules.
+        for i, layer in enumerate(self.layers):
+            if isinstance(layer, PPMissingLayer):
+                continue
+            next_layer = self.layers[i + 1] if i + 1 < len(self.layers) else None
+            layer.__dict__["next_layer"] = next_layer
+        
+        owner_fused_moe = next(
+            (
+                layer.mlp.experts for layer in self.layers
+                if not isinstance(layer, PPMissingLayer) and isinstance(layer.mlp, DeepseekV2MoE)
+            ),
+            None,
+        )
+        if owner_fused_moe is None:
+            raise RuntimeError("Failed to find a local FusedMoE layer for expert cache.")
+        self.expert_cache.create_cache(owner_fused_moe=owner_fused_moe)
+        for layer in self.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
+            if isinstance(layer.mlp, DeepseekV2MoE):
+                layer.mlp.experts.__dict__["expert_cache"] = self.expert_cache
+        
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -1235,6 +1461,9 @@ class DeepseekV2Model(nn.Module):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
+        top_k = config.n_routed_experts
+        
+        
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1264,7 +1493,7 @@ class DeepseekV2Model(nn.Module):
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
-
+            
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -1346,8 +1575,11 @@ class DeepseekV2ForCausalLM(
                 "kv_a_proj_with_mqa",
             ]
 
+        self.expert_cache = ExpertCache(
+            num_experts=self.config.n_routed_experts
+        )
         self.model = DeepseekV2Model(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"), expert_cache=self.expert_cache
         )
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
@@ -1461,6 +1693,8 @@ class DeepseekV2ForCausalLM(
         )
 
         params_dict = dict(self.named_parameters())
+        
+        # print(f"[Note] hieuvt: params_dict keys: {list(params_dict.keys())}")
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -1621,6 +1855,15 @@ class DeepseekV2ForCausalLM(
                         weight_loader(param, loaded_weight)
             if not is_fuse_shared_experts_layer:
                 loaded_params.add(name)
+        try:
+            cache_param_names = getattr(self.expert_cache, "cached_parameter_names", ())
+            for param_name in cache_param_names:
+                loaded_params.add(f"expert_cache.expert_cache_ping_{param_name}")
+                loaded_params.add(f"expert_cache.expert_cache_pong_{param_name}")
+        except Exception:
+            raise RuntimeError(
+                "Failed to add expert cache parameters to loaded_params. "
+                "Make sure expert_cache is properly initialized and has attribute cached_parameter_names.")
 
         return loaded_params
 
