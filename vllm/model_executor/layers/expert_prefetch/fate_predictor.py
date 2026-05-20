@@ -19,7 +19,7 @@ class FatePredictor:
                 weight = layer.mlp.gate.weight.detach().clone().to(self.device)
                 self.gate_weights[i] = weight
                 
-        self.save_gate_weights()
+        # self.save_gate_weights()
 
     def save_gate_weights(self, path: str | Path = "vllm/model_executor/layers/expert_prefetch/checkpoints/fate_predictor.pt") -> None:
         path = Path(path)
