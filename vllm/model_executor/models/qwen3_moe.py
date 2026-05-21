@@ -723,7 +723,7 @@ class Qwen3MoeModel(nn.Module):
         # Passing num_experts makes topk return every expert index and breaks prefetch / accuracy logs.
         top_k = config.num_experts_per_tok
         self.expert_predictor = MultiCheckpointExpertPredictor(
-            checkpoint_dir="vllm/model_executor/layers/expert_prefetch/checkpoints/final/",
+            checkpoint_dir="vllm/model_executor/layers/expert_prefetch/checkpoints/qwen3_moe/final",
             top_k=top_k,
             device="cuda",
         )
